@@ -1,20 +1,22 @@
 ﻿using Titanium.Web.Proxy.Models;
 using Titanium.Web.Proxy.StreamExtended;
 
-namespace Titanium.Web.Proxy.Http;
-
-/// <summary>
-///     The tcp tunnel Connect request.
-/// </summary>
-public class ConnectRequest : Request
+namespace Titanium.Web.Proxy.Http
 {
-    internal ConnectRequest(ByteString authority)
+
+    /// <summary>
+    ///     The tcp tunnel Connect request.
+    /// </summary>
+    public class ConnectRequest : Request
     {
-        Method = "CONNECT";
-        Authority = authority;
+        internal ConnectRequest(ByteString authority)
+        {
+            Method = "CONNECT";
+            Authority = authority;
+        }
+
+        public TunnelType TunnelType { get; internal set; }
+
+        public ClientHelloInfo? ClientHelloInfo { get; set; }
     }
-
-    public TunnelType TunnelType { get; internal set; }
-
-    public ClientHelloInfo? ClientHelloInfo { get; set; }
 }

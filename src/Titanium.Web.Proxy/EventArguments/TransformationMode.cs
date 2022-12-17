@@ -1,16 +1,18 @@
-﻿namespace Titanium.Web.Proxy.EventArguments;
-
-internal enum TransformationMode
+﻿namespace Titanium.Web.Proxy.EventArguments
 {
-    None,
 
-    /// <summary>
-    ///     Removes the chunked encoding
-    /// </summary>
-    RemoveChunked,
+    internal enum TransformationMode
+    {
+        None,
 
-    /// <summary>
-    ///     Uncompress the body (this also removes the chunked encoding if exists)
-    /// </summary>
-    Uncompress
+        /// <summary>
+        ///     Removes the chunked encoding
+        /// </summary>
+        RemoveChunked,
+
+        /// <summary>
+        ///     Uncompress the body (this also removes the chunked encoding if exists)
+        /// </summary>
+        Uncompress
+    }
 }

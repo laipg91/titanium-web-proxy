@@ -1,18 +1,20 @@
 using System;
 using System.Runtime.InteropServices;
 
-namespace Titanium.Web.Proxy.Helpers.WinHttp;
-
-internal class WinHttpHandle : SafeHandle
+namespace Titanium.Web.Proxy.Helpers.WinHttp
 {
-    public WinHttpHandle() : base(IntPtr.Zero, true)
-    {
-    }
 
-    public override bool IsInvalid => handle == IntPtr.Zero;
-
-    protected override bool ReleaseHandle()
+    internal class WinHttpHandle : SafeHandle
     {
-        return NativeMethods.WinHttp.WinHttpCloseHandle(handle);
+        public WinHttpHandle() : base(IntPtr.Zero, true)
+        {
+        }
+
+        public override bool IsInvalid => handle == IntPtr.Zero;
+
+        protected override bool ReleaseHandle()
+        {
+            return NativeMethods.WinHttp.WinHttpCloseHandle(handle);
+        }
     }
 }

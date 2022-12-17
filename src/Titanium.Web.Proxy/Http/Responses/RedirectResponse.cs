@@ -1,18 +1,21 @@
 ﻿using System.Net;
 
-namespace Titanium.Web.Proxy.Http.Responses;
-
-/// <summary>
-///     The http redirect response.
-/// </summary>
-public sealed class RedirectResponse : Response
+namespace Titanium.Web.Proxy.Http.Responses
 {
+
     /// <summary>
-    ///     Initializes a new instance of the <see cref="RedirectResponse" /> class.
+    ///     The http redirect response.
     /// </summary>
-    public RedirectResponse()
+    public sealed class RedirectResponse : Response
     {
-        StatusCode = (int)HttpStatusCode.Found;
-        StatusDescription = "Found";
+        /// <summary>
+        ///     Initializes a new instance of the <see cref="RedirectResponse" /> class.
+        /// </summary>
+        public RedirectResponse()
+        {
+            StatusCode = (int)HttpStatusCode.Found;
+            StatusDescription = "Found";
+        }
     }
+
 }

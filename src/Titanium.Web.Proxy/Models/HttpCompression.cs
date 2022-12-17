@@ -1,9 +1,11 @@
-﻿namespace Titanium.Web.Proxy.Compression;
-
-internal enum HttpCompression
+﻿namespace Titanium.Web.Proxy.Compression
 {
-    Unsupported,
-    Gzip,
-    Deflate,
-    Brotli
+
+    internal enum HttpCompression
+    {
+        Unsupported,
+        Gzip,
+        Deflate,
+        Brotli
+    }
 }

@@ -2,72 +2,74 @@
 using System.Text;
 using Titanium.Web.Proxy.Extensions;
 
-namespace Titanium.Web.Proxy.Models;
-
-internal struct ByteString : IEquatable<ByteString>
+namespace Titanium.Web.Proxy.Models
 {
-    public static ByteString Empty = new(ReadOnlyMemory<byte>.Empty);
 
-    public ReadOnlyMemory<byte> Data { get; }
-
-    public ReadOnlySpan<byte> Span => Data.Span;
-
-    public int Length => Data.Length;
-
-    public ByteString(ReadOnlyMemory<byte> data)
+    internal struct ByteString : IEquatable<ByteString>
     {
-        Data = data;
-    }
+        public static ByteString Empty = new(ReadOnlyMemory<byte>.Empty);
 
-    public override bool Equals(object? obj)
-    {
-        return obj is ByteString other && Equals(other);
-    }
+        public ReadOnlyMemory<byte> Data { get; }
 
-    public bool Equals(ByteString other)
-    {
-        return Data.Span.SequenceEqual(other.Data.Span);
-    }
+        public ReadOnlySpan<byte> Span => Data.Span;
 
-    public int IndexOf(byte value)
-    {
-        return Span.IndexOf(value);
-    }
+        public int Length => Data.Length;
 
-    public ByteString Slice(int start)
-    {
-        return Data.Slice(start);
-    }
+        public ByteString(ReadOnlyMemory<byte> data)
+        {
+            Data = data;
+        }
 
-    public ByteString Slice(int start, int length)
-    {
-        return Data.Slice(start, length);
-    }
+        public override bool Equals(object? obj)
+        {
+            return obj is ByteString other && Equals(other);
+        }
 
-    public override int GetHashCode()
-    {
-        return Data.GetHashCode();
-    }
+        public bool Equals(ByteString other)
+        {
+            return Data.Span.SequenceEqual(other.Data.Span);
+        }
 
-    public override string ToString()
-    {
-        return this.GetString();
-    }
+        public int IndexOf(byte value)
+        {
+            return Span.IndexOf(value);
+        }
 
-    public static explicit operator ByteString(string str)
-    {
-        return new(Encoding.ASCII.GetBytes(str));
-    }
+        public ByteString Slice(int start)
+        {
+            return Data.Slice(start);
+        }
 
-    public static implicit operator ByteString(byte[] data)
-    {
-        return new(data);
-    }
+        public ByteString Slice(int start, int length)
+        {
+            return Data.Slice(start, length);
+        }
 
-    public static implicit operator ByteString(ReadOnlyMemory<byte> data)
-    {
-        return new(data);
-    }
+        public override int GetHashCode()
+        {
+            return Data.GetHashCode();
+        }
 
-    public byte this[int i] => Span[i];
+        public override string ToString()
+        {
+            return this.GetString();
+        }
+
+        public static explicit operator ByteString(string str)
+        {
+            return new(Encoding.ASCII.GetBytes(str));
+        }
+
+        public static implicit operator ByteString(byte[] data)
+        {
+            return new(data);
+        }
+
+        public static implicit operator ByteString(ReadOnlyMemory<byte> data)
+        {
+            return new(data);
+        }
+
+        public byte this[int i] => Span[i];
+    }
 }

@@ -1,32 +1,35 @@
 ﻿using Titanium.Web.Proxy.Http;
 
-namespace Titanium.Web.Proxy.EventArguments;
-
-/// <summary>
-///     Class that wraps the multipart sent request arguments.
-/// </summary>
-public class MultipartRequestPartSentEventArgs : ProxyEventArgsBase
+namespace Titanium.Web.Proxy.EventArguments
 {
-    internal MultipartRequestPartSentEventArgs(SessionEventArgs session, string boundary, HeaderCollection headers) :
-        base(session.Server, session.ClientConnection)
+
+    /// <summary>
+    ///     Class that wraps the multipart sent request arguments.
+    /// </summary>
+    public class MultipartRequestPartSentEventArgs : ProxyEventArgsBase
     {
-        Session = session;
-        Boundary = boundary;
-        Headers = headers;
+        internal MultipartRequestPartSentEventArgs(SessionEventArgs session, string boundary, HeaderCollection headers)
+            :
+            base(session.Server, session.ClientConnection)
+        {
+            Session = session;
+            Boundary = boundary;
+            Headers = headers;
+        }
+
+        /// <value>
+        ///     The session arguments.
+        /// </value>
+        public SessionEventArgs Session { get; }
+
+        /// <summary>
+        ///     Boundary.
+        /// </summary>
+        public string Boundary { get; }
+
+        /// <summary>
+        ///     The header collection.
+        /// </summary>
+        public HeaderCollection Headers { get; }
     }
-
-    /// <value>
-    ///     The session arguments.
-    /// </value>
-    public SessionEventArgs Session { get; }
-
-    /// <summary>
-    ///     Boundary.
-    /// </summary>
-    public string Boundary { get; }
-
-    /// <summary>
-    ///     The header collection.
-    /// </summary>
-    public HeaderCollection Headers { get; }
 }

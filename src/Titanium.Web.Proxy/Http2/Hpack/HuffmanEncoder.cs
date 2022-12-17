@@ -19,78 +19,80 @@ using System;
 using System.IO;
 using Titanium.Web.Proxy.Models;
 
-namespace Titanium.Web.Proxy.Http2.Hpack;
-
-internal class HuffmanEncoder
+namespace Titanium.Web.Proxy.Http2.Hpack
 {
-    /// <summary>
-    ///     Huffman Encoder
-    /// </summary>
-    public static readonly HuffmanEncoder Instance = new();
 
-    /// <summary>
-    ///     the Huffman codes indexed by symbol
-    /// </summary>
-    private readonly int[] codes = HpackUtil.HuffmanCodes;
-
-    /// <summary>
-    ///     the length of each Huffman code
-    /// </summary>
-    private readonly byte[] lengths = HpackUtil.HuffmanCodeLengths;
-
-    /// <summary>
-    ///     Compresses the input string literal using the Huffman coding.
-    /// </summary>
-    /// <param name="output">the output stream for the compressed data</param>
-    /// <param name="data">the string literal to be Huffman encoded</param>
-    /// <exception cref="IOException">
-    ///     if an I/O error occurs. In particular, an <code>IOException</code> may be thrown if the
-    ///     output stream has been closed.
-    /// </exception>
-    public void Encode(BinaryWriter output, ByteString data)
+    internal class HuffmanEncoder
     {
-        if (output == null) throw new ArgumentNullException(nameof(output));
+        /// <summary>
+        ///     Huffman Encoder
+        /// </summary>
+        public static readonly HuffmanEncoder Instance = new();
 
-        if (data.Length == 0) return;
+        /// <summary>
+        ///     the Huffman codes indexed by symbol
+        /// </summary>
+        private readonly int[] codes = HpackUtil.HuffmanCodes;
 
-        var current = 0L;
-        var n = 0;
+        /// <summary>
+        ///     the length of each Huffman code
+        /// </summary>
+        private readonly byte[] lengths = HpackUtil.HuffmanCodeLengths;
 
-        for (var i = 0; i < data.Length; i++)
+        /// <summary>
+        ///     Compresses the input string literal using the Huffman coding.
+        /// </summary>
+        /// <param name="output">the output stream for the compressed data</param>
+        /// <param name="data">the string literal to be Huffman encoded</param>
+        /// <exception cref="IOException">
+        ///     if an I/O error occurs. In particular, an <code>IOException</code> may be thrown if the
+        ///     output stream has been closed.
+        /// </exception>
+        public void Encode(BinaryWriter output, ByteString data)
         {
-            var b = data.Span[i] & 0xFF;
-            var code = (uint)codes[b];
-            int nbits = lengths[b];
+            if (output == null) throw new ArgumentNullException(nameof(output));
 
-            current <<= nbits;
-            current |= code;
-            n += nbits;
+            if (data.Length == 0) return;
 
-            while (n >= 8)
+            var current = 0L;
+            var n = 0;
+
+            for (var i = 0; i < data.Length; i++)
             {
-                n -= 8;
-                output.Write((byte)(current >> n));
+                var b = data.Span[i] & 0xFF;
+                var code = (uint)codes[b];
+                int nbits = lengths[b];
+
+                current <<= nbits;
+                current |= code;
+                n += nbits;
+
+                while (n >= 8)
+                {
+                    n -= 8;
+                    output.Write((byte)(current >> n));
+                }
+            }
+
+            if (n > 0)
+            {
+                current <<= 8 - n;
+                current |= (uint)(0xFF >> n); // this should be EOS symbol
+                output.Write((byte)current);
             }
         }
 
-        if (n > 0)
+        /// <summary>
+        ///     Returns the number of bytes required to Huffman encode the input string literal.
+        /// </summary>
+        /// <returns>the number of bytes required to Huffman encode <code>data</code></returns>
+        /// <param name="data">the string literal to be Huffman encoded</param>
+        public int GetEncodedLength(ByteString data)
         {
-            current <<= 8 - n;
-            current |= (uint)(0xFF >> n); // this should be EOS symbol
-            output.Write((byte)current);
+            var len = 0L;
+            foreach (var b in data.Span) len += lengths[b];
+
+            return (int)((len + 7) >> 3);
         }
-    }
-
-    /// <summary>
-    ///     Returns the number of bytes required to Huffman encode the input string literal.
-    /// </summary>
-    /// <returns>the number of bytes required to Huffman encode <code>data</code></returns>
-    /// <param name="data">the string literal to be Huffman encoded</param>
-    public int GetEncodedLength(ByteString data)
-    {
-        var len = 0L;
-        foreach (var b in data.Span) len += lengths[b];
-
-        return (int)((len + 7) >> 3);
     }
 }

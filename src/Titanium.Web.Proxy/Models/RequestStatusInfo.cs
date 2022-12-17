@@ -1,18 +1,20 @@
 ﻿using System;
 using Titanium.Web.Proxy.Models;
 
-namespace Titanium.Web.Proxy.Helpers;
-
-internal struct RequestStatusInfo
+namespace Titanium.Web.Proxy.Helpers
 {
-    public string Method { get; set; }
 
-    public ByteString RequestUri { get; set; }
-
-    public Version Version { get; set; }
-
-    public bool IsEmpty()
+    internal struct RequestStatusInfo
     {
-        return Method == null && RequestUri.Length == 0 && Version == null;
+        public string Method { get; set; }
+
+        public ByteString RequestUri { get; set; }
+
+        public Version Version { get; set; }
+
+        public bool IsEmpty()
+        {
+            return Method == null && RequestUri.Length == 0 && Version == null;
+        }
     }
 }
