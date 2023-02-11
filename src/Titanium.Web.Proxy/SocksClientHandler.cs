@@ -2,7 +2,9 @@
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
+using Titanium.Web.Proxy.EventArguments;
 using Titanium.Web.Proxy.Extensions;
+using Titanium.Web.Proxy.Helpers;
 using Titanium.Web.Proxy.Models;
 using Titanium.Web.Proxy.Network.Tcp;
 
@@ -26,8 +28,12 @@ namespace Titanium.Web.Proxy
             var stream = clientConnection.GetStream();
             var buffer = BufferPool.GetBuffer();
             var port = 0;
+            SessionEventArgs sessionEventArgs =null;
             try
             {
+                sessionEventArgs = new SessionEventArgs(this, endPoint,
+                    new HttpClientStream(this, clientConnection, stream, BufferPool, cancellationToken), null,
+                    cancellationTokenSource);
                 var read = await stream.ReadAsync(buffer, 0, buffer.Length, cancellationToken);
                 if (read < 3) return;
 
@@ -90,7 +96,7 @@ namespace Titanium.Web.Proxy
                         var password = Encoding.ASCII.GetString(buffer, 3 + userNameLength, passwordLength);
                         var success = true;
                         if (ProxyBasicAuthenticateFunc != null)
-                            success = await ProxyBasicAuthenticateFunc.Invoke(null, userName, password);
+                            success = await ProxyBasicAuthenticateFunc.Invoke(sessionEventArgs, userName, password);
 
                         buffer[1] = success ? (byte)0 : (byte)1;
                         await stream.WriteAsync(buffer, 0, 2, cancellationToken);
@@ -138,6 +144,7 @@ namespace Titanium.Web.Proxy
             finally
             {
                 BufferPool.ReturnBuffer(buffer);
+                sessionEventArgs?.Dispose();
             }
 
             await HandleClient(endPoint, clientConnection, port, cancellationTokenSource, cancellationToken);
