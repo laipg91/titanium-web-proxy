@@ -31,13 +31,10 @@ namespace Titanium.Web.Proxy
             SessionEventArgs sessionEventArgs =null;
             try
             {
-                sessionEventArgs = new SessionEventArgs(this, endPoint,
-                    new HttpClientStream(this, clientConnection, stream, BufferPool, cancellationToken), null,
-                    cancellationTokenSource);
                 var read = await stream.ReadAsync(buffer, 0, buffer.Length, cancellationToken);
                 if (read < 3) return;
 
-                if (buffer[0] == 4)
+                if (buffer[0] == 4) //Socks client version 4
                 {
                     if (read < 9 || buffer[1] != 1)
                         // not a connect request
@@ -47,9 +44,18 @@ namespace Titanium.Web.Proxy
 
                     buffer[0] = 0;
                     buffer[1] = 90; // request granted
+                    if (ProxyBasicAuthenticateFunc != null)
+                    {
+                        //Socks4 doesnt support authentication, so if set authentication we need reject the connection
+                        buffer[1] = 91;//request rejected or failed
+                    }
                     await stream.WriteAsync(buffer, 0, 8, cancellationToken);
+                    if (buffer[1] != 90) //denied
+                    {
+                        return;
+                    }
                 }
-                else if (buffer[0] == 5)
+                else if (buffer[0] == 5) //Socks client version 5
                 {
                     int authenticationMethodCount = buffer[1];
                     if (read < authenticationMethodCount + 2) return;
@@ -96,7 +102,12 @@ namespace Titanium.Web.Proxy
                         var password = Encoding.ASCII.GetString(buffer, 3 + userNameLength, passwordLength);
                         var success = true;
                         if (ProxyBasicAuthenticateFunc != null)
+                        {
+                            sessionEventArgs = new SessionEventArgs(this, endPoint,
+                                new HttpClientStream(this, clientConnection, stream, BufferPool, cancellationToken), null,
+                                cancellationTokenSource);
                             success = await ProxyBasicAuthenticateFunc.Invoke(sessionEventArgs, userName, password);
+                        }
 
                         buffer[1] = success ? (byte)0 : (byte)1;
                         await stream.WriteAsync(buffer, 0, 2, cancellationToken);
