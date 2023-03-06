@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Linq;
 using System.Net;
 using System.Text;
 using System.Threading.Tasks;
@@ -26,6 +27,15 @@ namespace Titanium.Web.Proxy
 
             try
             {
+                if (ProxySchemeAuthenticateFunc != null && ProxyAuthenticationSchemes.Contains("IP-Address"))
+                {
+                    var result = await ProxySchemeAuthenticateFunc(session, "IP-Address", string.Empty);
+                    if (result.Result == ProxyAuthenticationResult.Success)
+                        return true;
+                    else if (result.Result == ProxyAuthenticationResult.Failure)
+                        return false;
+                }
+
                 var headerObj = httpHeaders.GetFirstHeader(KnownHeaders.ProxyAuthorization);
                 if (headerObj == null)
                 {
@@ -46,7 +56,7 @@ namespace Titanium.Web.Proxy
 
                 var authenticationType = header.AsMemory(0, firstSpace);
                 var credentials = header.AsMemory(firstSpace + 1);
-
+                
                 if (ProxyBasicAuthenticateFunc != null)
                     return await AuthenticateUserBasic(session, authenticationType, credentials,
                         ProxyBasicAuthenticateFunc);
@@ -133,7 +143,10 @@ namespace Titanium.Web.Proxy
 
             if (ProxySchemeAuthenticateFunc != null)
                 foreach (var scheme in ProxyAuthenticationSchemes)
-                    response.Headers.AddHeader(KnownHeaders.ProxyAuthenticate, scheme);
+                    if (!scheme.Equals("IP-Address", StringComparison.CurrentCultureIgnoreCase))
+                        response.Headers.AddHeader(KnownHeaders.ProxyAuthenticate, scheme);
+                    
+                
 
             response.Headers.AddHeader(KnownHeaders.ProxyConnection, KnownHeaders.ProxyConnectionClose);
 

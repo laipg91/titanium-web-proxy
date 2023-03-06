@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Linq;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
@@ -34,6 +35,10 @@ namespace Titanium.Web.Proxy
                 var read = await stream.ReadAsync(buffer, 0, buffer.Length, cancellationToken);
                 if (read < 3) return;
 
+                sessionEventArgs = new SessionEventArgs(this, endPoint,
+                    new HttpClientStream(this, clientConnection, stream, BufferPool, cancellationToken), null,
+                    cancellationTokenSource);
+
                 if (buffer[0] == 4) //Socks client version 4
                 {
                     if (read < 9 || buffer[1] != 1)
@@ -44,16 +49,21 @@ namespace Titanium.Web.Proxy
 
                     buffer[0] = 0;
                     buffer[1] = 90; // request granted
-                    if (ProxyBasicAuthenticateFunc != null)
+                    
+                    if (ProxyAuthenticationSchemes.Contains("IP-Address") && ProxySchemeAuthenticateFunc != null)
                     {
-                        //Socks4 doesnt support authentication, so if set authentication we need reject the connection
-                        buffer[1] = 91;//request rejected or failed
+                        //Socks4 doesnt support authentication, so if set authentication we can verify by IP if needed
+                        var authResult = await ProxySchemeAuthenticateFunc.Invoke(sessionEventArgs, "IP-Address", string.Empty);
+                        if (authResult.Result != ProxyAuthenticationResult.Success)
+                        {
+                            buffer[1] = 91;//request rejected or failed
+                        }
+
                     }
+
                     await stream.WriteAsync(buffer, 0, 8, cancellationToken);
-                    if (buffer[1] != 90) //denied
-                    {
+                    if (buffer[1]!=90) //denied
                         return;
-                    }
                 }
                 else if (buffer[0] == 5) //Socks client version 5
                 {
@@ -64,9 +74,19 @@ namespace Titanium.Web.Proxy
                     for (var i = 0; i < authenticationMethodCount; i++)
                     {
                         int method = buffer[i + 2];
-                        if (method == 0 && ProxyBasicAuthenticateFunc == null)
+                        if (method == 0)
                         {
-                            acceptedMethod = 0;
+                            bool success = true;
+                            if (ProxyAuthenticationSchemes.Contains("IP-Address") && ProxySchemeAuthenticateFunc != null)
+                            {
+                                //client send no authentication but we need verify by IP then we need parse an empty username/password
+                                var authResult = await ProxySchemeAuthenticateFunc.Invoke(sessionEventArgs, "IP-Address", string.Empty);
+                                if (authResult.Result != ProxyAuthenticationResult.Success)
+                                    success = false;
+                            }
+                            if(success)
+                                acceptedMethod = 0;
+
                             break;
                         }
 
@@ -83,7 +103,7 @@ namespace Titanium.Web.Proxy
                     if (acceptedMethod == 255)
                         // no acceptable method
                         return;
-
+                    
                     if (acceptedMethod == 2)
                     {
                         read = await stream.ReadAsync(buffer, 0, buffer.Length, cancellationToken);
@@ -103,9 +123,6 @@ namespace Titanium.Web.Proxy
                         var success = true;
                         if (ProxyBasicAuthenticateFunc != null)
                         {
-                            sessionEventArgs = new SessionEventArgs(this, endPoint,
-                                new HttpClientStream(this, clientConnection, stream, BufferPool, cancellationToken), null,
-                                cancellationTokenSource);
                             success = await ProxyBasicAuthenticateFunc.Invoke(sessionEventArgs, userName, password);
                         }
 
