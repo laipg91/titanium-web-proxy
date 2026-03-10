@@ -43,5 +43,24 @@ namespace Titanium.Web.Proxy.Models
             if (BeforeSslAuthenticate != null)
                 await BeforeSslAuthenticate.InvokeAsync(proxyServer, connectArgs, exceptionFunc);
         }
+
+        /// <summary>
+        ///     Enable SOCKS5 UDP Associate (CMD=0x03) support.
+        ///     Defaults to false for backward compatibility.
+        /// </summary>
+        public bool EnableUdpAssociate { get; set; } = false;
+
+        /// <summary>
+        ///     Maximum number of concurrent UDP relay sessions.
+        ///     Set to 0 for unlimited. Each session uses one Socket + two background tasks.
+        ///     Defaults to 0 (unlimited).
+        /// </summary>
+        public int MaxUdpAssociateSessions { get; set; } = 0;
+
+        /// <summary>
+        ///     Seconds of inactivity before a UDP relay session is torn down.
+        ///     Defaults to 120 seconds.
+        /// </summary>
+        public int UdpAssociateTimeoutSeconds { get; set; } = 120;
     }
 }

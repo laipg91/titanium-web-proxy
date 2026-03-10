@@ -29,6 +29,7 @@ namespace Titanium.Web.Proxy
             var stream = clientConnection.GetStream();
             var buffer = BufferPool.GetBuffer();
             var port = 0;
+            var isUdpAssociate = false;
             SessionEventArgs sessionEventArgs =null;
             try
             {
@@ -132,37 +133,47 @@ namespace Titanium.Web.Proxy
                     }
 
                     read = await stream.ReadAsync(buffer, 0, buffer.Length, cancellationToken);
-                    if (read < 10 || buffer[1] != 1) return;
+                    var cmd = buffer[1];
+                    if (read < 10 || (cmd != 1 && cmd != 3)) return;
 
-                    int portIdx;
-                    switch (buffer[3])
+                    if (cmd == 3) // UDP ASSOCIATE
                     {
-                        case 1:
-                            // IPv4
-                            portIdx = 8;
-                            break;
-                        case 3:
-                            // Domainname
-                            portIdx = buffer[4] + 5;
+                        isUdpAssociate = true;
+                        // Reply is sent inside HandleUdpAssociate after relay socket is bound.
+                        // Just break out of the handshake block — buffer is returned in finally.
+                    }
+                    else // CMD = CONNECT (0x01)
+                    {
+                        int portIdx;
+                        switch (buffer[3])
+                        {
+                            case 1:
+                                // IPv4
+                                portIdx = 8;
+                                break;
+                            case 3:
+                                // Domainname
+                                portIdx = buffer[4] + 5;
 
 #if DEBUG
-                            var hostname = new ByteString(buffer.AsMemory(5, buffer[4]));
-                            string hostnameStr = hostname.GetString();
+                                var hostname = new ByteString(buffer.AsMemory(5, buffer[4]));
+                                string hostnameStr = hostname.GetString();
 #endif
-                            break;
-                        case 4:
-                            // IPv6
-                            portIdx = 20;
-                            break;
-                        default:
-                            return;
-                    }
+                                break;
+                            case 4:
+                                // IPv6
+                                portIdx = 20;
+                                break;
+                            default:
+                                return;
+                        }
 
-                    if (read < portIdx + 2) return;
+                        if (read < portIdx + 2) return;
 
-                    port = (buffer[portIdx] << 8) + buffer[portIdx + 1];
-                    buffer[1] = 0; // succeeded
-                    await stream.WriteAsync(buffer, 0, read, cancellationToken);
+                        port = (buffer[portIdx] << 8) + buffer[portIdx + 1];
+                        buffer[1] = 0; // succeeded
+                        await stream.WriteAsync(buffer, 0, read, cancellationToken);
+                    } // end cmd == 1 block
                 }
                 else
                 {
@@ -173,6 +184,13 @@ namespace Titanium.Web.Proxy
             {
                 BufferPool.ReturnBuffer(buffer);
                 sessionEventArgs?.Dispose();
+            }
+
+            if (isUdpAssociate)
+            {
+                await HandleUdpAssociate(endPoint, clientConnection, stream, cancellationTokenSource,
+                    cancellationToken);
+                return;
             }
 
             await HandleClient(endPoint, clientConnection, port, cancellationTokenSource, cancellationToken);
