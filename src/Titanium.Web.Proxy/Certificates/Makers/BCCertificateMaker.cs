@@ -159,20 +159,14 @@ namespace Titanium.Web.Proxy.Network.Certificate
         private static X509Certificate2 WithPrivateKey(X509Certificate certificate, AsymmetricKeyParameter privateKey)
         {
             const string password = "password";
-            Pkcs12Store store;
 
+            var builder = new Pkcs12StoreBuilder();
             if (RunTime.IsRunningOnMono)
             {
-                var builder = new Pkcs12StoreBuilder();
                 builder.SetUseDerEncoding(true);
-                store = builder.Build();
-            }
-            else
-            {
-                store = new Pkcs12Store();
             }
 
-            var entry = new X509CertificateEntry(certificate);
+            var store = builder.Build(); var entry = new X509CertificateEntry(certificate);
             store.SetCertificateEntry(certificate.SubjectDN.ToString(), entry);
 
             store.SetKeyEntry(certificate.SubjectDN.ToString(), new AsymmetricKeyEntry(privateKey), new[] { entry });
@@ -200,8 +194,7 @@ namespace Titanium.Web.Proxy.Network.Certificate
         private X509Certificate2 MakeCertificateInternal(string hostName, string subjectName,
             DateTime validFrom, DateTime validTo, X509Certificate2? signingCertificate)
         {
-            if (signingCertificate == null)
-                return GenerateCertificate(null, subjectName, subjectName, validFrom, validTo);
+            if (signingCertificate == null) return GenerateCertificate(null, subjectName, subjectName, validFrom, validTo);
 
             var kp = DotNetUtilities.GetKeyPair(signingCertificate.PrivateKey);
             return GenerateCertificate(hostName, subjectName, signingCertificate.Subject, validFrom, validTo,
