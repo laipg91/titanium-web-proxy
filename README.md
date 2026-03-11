@@ -7,7 +7,7 @@ A lightweight HTTP(S) proxy server written in C#.
 Report bugs or raise issues here. For programming help use [StackOverflow](http://stackoverflow.com/questions/tagged/titanium-web-proxy) with the tag Titanium-Web-Proxy.
 
 * [API Documentation](https://justcoding121.github.io/titanium-web-proxy/docs/api/Titanium.Web.Proxy.ProxyServer.html)
-* [Wiki & Contribution guidelines](https://github.com/justcoding121/Titanium-Web-Proxy/wiki)
+* [Wiki & Contribution guidelines](https://github.com/laipg91/Titanium-Web-Proxy/wiki)
 
 ### Features
 
@@ -16,31 +16,23 @@ Report bugs or raise issues here. For programming help use [StackOverflow](http:
 * Supports mutual SSL authentication, proxy authentication & automatic upstream proxy detection
 * Supports kerberos, NTLM authentication over HTTP protocols on windows domain controlled networks
 * SOCKS4/5 Proxy support
+* HTTP/2 support but not tested
+* SOCKS5 with UDP Associate
 
-### Installation
-Install by [nuget](https://www.nuget.org/packages/Titanium.Web.Proxy)
-
-For beta releases on [beta branch](https://github.com/justcoding121/Titanium-Web-Proxy/tree/beta)
-
-    Install-Package Titanium.Web.Proxy -Pre
-
-For stable releases on [stable branch](https://github.com/justcoding121/Titanium-Web-Proxy/tree/stable)
-
-    Install-Package Titanium.Web.Proxy
 
 Supports
 
- * .NET Standard 2.0 or above
  * .NET Framework 4.5 or above
 
 ###  Note to contributors
+ * The original project now archived, this is the fork and maintained by laipg91
 
 #### Road map
 
 * Fix [outstanding bugs](https://github.com/justcoding121/Titanium-Web-Proxy/issues?q=is%3Aopen+is%3Aissue+label%3Abug)
 * Support reading request and response body as stream [#823](https://github.com/justcoding121/Titanium-Web-Proxy/issues/823)
 * Stop throwing new exceptions [#634](https://github.com/justcoding121/Titanium-Web-Proxy/issues/634)
-* Support HTTP 2.0 
+* Support HTTP 2.0 => Done (need to be tested)
 
 #### Collaborators
 
