@@ -1,6 +1,7 @@
 ﻿#if NETSTANDARD2_1
 using System;
 using System.Collections.Concurrent;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Net;
@@ -24,12 +25,10 @@ namespace Titanium.Web.Proxy.Http2
         public static readonly byte[] ConnectionPreface = Encoding.ASCII.GetBytes("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
 
         /// <summary>
-        ///     relays the input clientStream to the server at the specified host name and port with the given httpCmd and headers
-        ///     as prefix
-        ///     Useful for websocket requests
+        ///     Relays the input clientStream to the server at the specified host name and port with the given httpCmd and headers
+        ///     as prefix. Useful for HTTP/2 tunneling.
         ///     Task-based Asynchronous Pattern
         /// </summary>
-        /// <returns></returns>
         internal static async Task SendHttp2(Stream clientStream, Stream serverStream,
             Func<SessionEventArgs> sessionFactory,
             Func<SessionEventArgs, Task> onBeforeRequest, Func<SessionEventArgs, Task> onBeforeResponse,
@@ -67,9 +66,22 @@ namespace Titanium.Web.Proxy.Http2
             int headerTableSize = 0;
             Decoder? decoder = null;
 
+            // Stateful encoder per connection direction (Medium fix: reuse encoder for HPACK compression)
+            // Note: EncoderState wrapper used because async methods cannot have ref parameters.
+            var encoderState = new EncoderState();
+
             var frameHeader = new Http2FrameHeader();
             var frameHeaderBuffer = new byte[9];
             byte[]? buffer = null;
+
+            // Pending header block fragments for CONTINUATION frame support (High fix)
+            // Key: streamId, Value: accumulated header block fragment bytes
+            var pendingHeaderBlocks = new Dictionary<int, MemoryStream>();
+
+            // Stream-level flow control window sizes (High fix)
+            // Key: streamId, Value: current window size (initialized from SETTINGS_INITIAL_WINDOW_SIZE)
+            var streamWindowSizes = new Dictionary<int, int>();
+
             while (true)
             {
                 int read = await ForceRead(input, frameHeaderBuffer, 0, 9, cancellationToken);
@@ -105,20 +117,11 @@ namespace Titanium.Web.Proxy.Http2
 
                 SessionEventArgs? args = null;
                 RequestResponseBase? rr = null;
-                if (type == Http2FrameType.Data || type == Http2FrameType.Headers/* || type == Http2FrameType.PushPromise*/)
+
+                if (type == Http2FrameType.Data || type == Http2FrameType.Headers || type == Http2FrameType.PushPromise)
                 {
                     if (!sessions.TryGetValue(streamId, out args))
                     {
-                        //if (type == Http2FrameType.Data)
-                        //{
-                        //    throw new ProxyHttpException("HTTP Body data received before any header frame.", null, args);
-                        //}
-
-                        //if (type == Http2FrameType.Headers && !isClient)
-                        //{
-                        //    throw new ProxyHttpException("HTTP Response received before any Request header frame.", null, args);
-                        //}
-
                         if (type == Http2FrameType.PushPromise && isClient)
                         {
                             throw new ProxyHttpException("HTTP Push promise received from the client.", null, args);
@@ -127,6 +130,8 @@ namespace Titanium.Web.Proxy.Http2
                 }
 
                 //System.Diagnostics.Debug.WriteLine("CONN: " + connectionId + ", CLIENT: " + isClient + ", STREAM: " + streamId + ", TYPE: " + type);
+
+                // ==================== DATA frame ====================
                 if (type == Http2FrameType.Data && args != null)
                 {
                     if (isClient)
@@ -150,21 +155,24 @@ namespace Titanium.Web.Proxy.Http2
 
                     if (rr.ReadHttp2BodyTaskCompletionSource != null)
                     {
-                        // Get body method was called in the "before" event handler
-
+                        // GetBody() was called in the "before" event handler
                         var data = rr.Http2BodyData;
                         int offset = 0;
+                        int dataLength = length;
+
+                        // Fix Medium: Handle padding correctly in DATA frames (RFC 7540 §6.1)
                         if (padded)
                         {
-                            offset++;
-                            length--;
-                            length -= buffer[0];
+                            int padLength = buffer[0];
+                            offset = 1;
+                            dataLength = length - 1 - padLength;
                         }
 
-                        data!.Write(buffer, offset, length);
+                        data!.Write(buffer, offset, dataLength);
                     }
                 }
-                else if (type == Http2FrameType.Headers/* || type == Http2FrameType.PushPromise*/)
+                // ==================== HEADERS frame ====================
+                else if (type == Http2FrameType.Headers || type == Http2FrameType.PushPromise)
                 {
                     bool endHeaders = (flags & Http2FrameFlag.EndHeaders) != 0;
                     bool padded = (flags & Http2FrameFlag.Padded) != 0;
@@ -176,25 +184,31 @@ namespace Titanium.Web.Proxy.Http2
                     }
 
                     int offset = 0;
+
+                    // Fix Medium: Handle padding correctly in HEADERS frames (RFC 7540 §6.2)
+                    int padLength = 0;
                     if (padded)
                     {
-                        offset = 1;
-                        Breakpoint();
+                        padLength = buffer[offset++];
                     }
 
                     if (type == Http2FrameType.PushPromise)
                     {
+                        // Fix Medium: Handle PUSH_PROMISE properly (RFC 7540 §6.6)
                         int promisedStreamId =
- (buffer[offset++] << 24) + (buffer[offset++] << 16) + (buffer[offset++] << 8) + buffer[offset++];
+                            ((buffer[offset] & 0x7f) << 24) + (buffer[offset + 1] << 16) +
+                            (buffer[offset + 2] << 8) + buffer[offset + 3];
+                        offset += 4;
+
                         if (!sessions.TryGetValue(streamId, out args))
                         {
                             args = sessionFactory();
                             args.IsPromise = true;
                             if (!sessions.TryAdd(streamId, args))
                                 ;
-                            if (!sessions.TryAdd(promisedStreamId, args))
-                                ;
                         }
+                        // Register the promised stream ID as well
+                        sessions.TryAdd(promisedStreamId, args);
 
                         System.Diagnostics.Debug.WriteLine("PROMISE STREAM: " + streamId + ", " + promisedStreamId +
                                                            ", CONN: " + connectionId);
@@ -202,11 +216,10 @@ namespace Titanium.Web.Proxy.Http2
 
                         if (isClient)
                         {
-                            // push_promise from client???
-                            Breakpoint();
+                            Breakpoint(); // push_promise from client is a protocol violation
                         }
                     }
-                    else
+                    else // HEADERS
                     {
                         if (!sessions.TryGetValue(streamId, out args))
                         {
@@ -216,93 +229,99 @@ namespace Titanium.Web.Proxy.Http2
                         }
 
                         rr = isClient ? (RequestResponseBase)args.HttpClient.Request : args.HttpClient.Response;
+
                         if (priority)
                         {
-                            var priorityData = ((long)buffer[offset++] << 32) + ((long)buffer[offset++] << 24) +
-                                               (buffer[offset++] << 16) + (buffer[offset++] << 8) + buffer[offset++];
+                            // 5 bytes: Exclusive(1 bit) + Stream Dependency(31 bits) + Weight(8 bits)
+                            var priorityData = ((long)(buffer[offset] & 0x7f) << 32) +
+                                               ((long)buffer[offset + 1] << 24) +
+                                               (buffer[offset + 2] << 16) +
+                                               (buffer[offset + 3] << 8) +
+                                               buffer[offset + 4];
                             rr.Priority = priorityData;
+                            offset += 5;
                         }
                     }
 
+                    int dataLength = length - offset - padLength;
 
-                    int dataLength = length - offset;
-                    if (padded)
+                    // Fix High: CONTINUATION frame support – buffer fragments until EndHeaders
+                    // Accumulate this fragment into the pending header block for this stream
+                    if (!pendingHeaderBlocks.TryGetValue(streamId, out var pendingMs))
                     {
-                        dataLength -= buffer[0];
+                        pendingMs = new MemoryStream();
+                        pendingHeaderBlocks[streamId] = pendingMs;
                     }
-
-                    var headerListener = new MyHeaderListener(
-                        (name, value) =>
-                        {
-                            var headers = isClient ? args.HttpClient.Request.Headers : args.HttpClient.Response.Headers;
-                            headers.AddHeader(new HttpHeader(name, value));
-                        });
-                    try
-                    {
-                        // recreate the decoder when new value is bigger
-                        // should we recreate when smaller, too?
-                        if (decoder == null || headerTableSize < localSettings.HeaderTableSize)
-                        {
-                            headerTableSize = localSettings.HeaderTableSize;
-                            decoder = new Decoder(8192, headerTableSize);
-                        }
-
-                        decoder.Decode(new BinaryReader(new MemoryStream(buffer, offset, dataLength)),
-                            headerListener);
-                        decoder.EndHeaderBlock();
-
-                        if (rr is Request request)
-                        {
-                            var method = headerListener.Method;
-                            var path = headerListener.Path;
-                            if (method.Length == 0 || path.Length == 0)
-                            {
-                                throw new Exception("HTTP/2 Missing method or path");
-                            }
-
-                            request.HttpVersion = HttpVersion.Version20;
-                            request.Method = method.GetString();
-                            request.IsHttps = headerListener.Scheme == ProxyServer.UriSchemeHttps;
-                            request.Authority = headerListener.Authority;
-                            request.RequestUriString8 = path;
-
-                            //request.RequestUri = headerListener.GetUri();
-                        }
-                        else
-                        {
-                            var response = (Response)rr;
-                            response.HttpVersion = HttpVersion.Version20;
-
-                            // todo: avoid string conversion
-                            string statusHack = HttpHeader.Encoding.GetString(headerListener.Status.Span);
-                            int.TryParse(statusHack, out int statusCode);
-                            response.StatusCode = statusCode;
-                            response.StatusDescription = string.Empty;
-                        }
-                    }
-                    catch (Exception ex)
-                    {
-                        exceptionFunc?.Invoke(new ProxyHttpException("Failed to decode HTTP/2 headers", ex, args));
-                    }
-
-                    if (!endHeaders)
-                    {
-                        Breakpoint();
-                    }
+                    pendingMs.Write(buffer, offset, dataLength);
 
                     if (endHeaders)
                     {
-                        var tcs = new TaskCompletionSource<bool>();
-                        rr.ReadHttp2BeforeHandlerTaskCompletionSource = tcs;
+                        // All header fragments received – decode the complete block
+                        var completeHeaderData = pendingMs.ToArray();
+                        pendingHeaderBlocks.Remove(streamId);
 
-                        var handler = onBeforeRequestResponse(args);
+                        var headerListener = new MyHeaderListener(
+                            (name, value) =>
+                            {
+                                var headers = isClient ? args!.HttpClient.Request.Headers : args!.HttpClient.Response.Headers;
+                                headers.AddHeader(new HttpHeader(name, value));
+                            });
+                        try
+                        {
+                            // Recreate the decoder when new value is bigger
+                            if (decoder == null || headerTableSize < localSettings.HeaderTableSize)
+                            {
+                                headerTableSize = localSettings.HeaderTableSize;
+                                decoder = new Decoder(8192, headerTableSize);
+                            }
+
+                            decoder.Decode(new BinaryReader(new MemoryStream(completeHeaderData)),
+                                headerListener);
+                            decoder.EndHeaderBlock();
+
+                            if (rr is Request request)
+                            {
+                                var method = headerListener.Method;
+                                var path = headerListener.Path;
+                                if (method.Length == 0 || path.Length == 0)
+                                {
+                                    throw new Exception("HTTP/2 Missing method or path");
+                                }
+
+                                request.HttpVersion = HttpVersion.Version20;
+                                request.Method = method.GetString();
+                                request.IsHttps = headerListener.Scheme == ProxyServer.UriSchemeHttps;
+                                request.Authority = headerListener.Authority;
+                                request.RequestUriString8 = path;
+                            }
+                            else
+                            {
+                                var response = (Response)rr!;
+                                response.HttpVersion = HttpVersion.Version20;
+
+                                // todo: avoid string conversion
+                                string statusHack = HttpHeader.Encoding.GetString(headerListener.Status.Span);
+                                int.TryParse(statusHack, out int statusCode);
+                                response.StatusCode = statusCode;
+                                response.StatusDescription = string.Empty;
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            exceptionFunc?.Invoke(new ProxyHttpException("Failed to decode HTTP/2 headers", ex, args));
+                        }
+
+                        var tcs = new TaskCompletionSource<bool>();
+                        rr!.ReadHttp2BeforeHandlerTaskCompletionSource = tcs;
+
+                        var handler = onBeforeRequestResponse(args!);
                         rr.Http2BeforeHandlerTask = handler;
 
                         if (handler == await Task.WhenAny(tcs.Task, handler))
                         {
                             rr.ReadHttp2BeforeHandlerTaskCompletionSource = null;
                             tcs.SetResult(true);
-                            await SendHeader(remoteSettings, frameHeader, frameHeaderBuffer, rr, endStream, output, args.IsPromise);
+                            await SendHeader(remoteSettings, encoderState, frameHeader, frameHeaderBuffer, rr, endStream, output, args!.IsPromise);
                         }
                         else
                         {
@@ -311,55 +330,237 @@ namespace Titanium.Web.Proxy.Http2
 
                         rr.Locked = true;
                     }
+                    // else: waiting for CONTINUATION frames – don't send yet
 
                     sendPacket = false;
                 }
+                // ==================== CONTINUATION frame ====================
+                // Fix High: Implement CONTINUATION frame (RFC 7540 §6.10)
                 else if (type == Http2FrameType.Continuation)
                 {
-                    // todo: implementing this type is mandatory for multi-part headers
-                    Breakpoint();
+                    bool endHeaders = (flags & Http2FrameFlag.EndHeaders) != 0;
+
+                    if (!pendingHeaderBlocks.TryGetValue(streamId, out var pendingMs))
+                    {
+                        // CONTINUATION without preceding HEADERS – protocol error
+                        exceptionFunc?.Invoke(new ProxyHttpException(
+                            "HTTP/2 CONTINUATION frame received without preceding HEADERS frame on stream " + streamId,
+                            null, null));
+                        return;
+                    }
+
+                    // Append the fragment
+                    pendingMs.Write(buffer, 0, length);
+
+                    if (endHeaders)
+                    {
+                        // Complete block assembled – decode now
+                        // We need to find the session that was started by the HEADERS frame
+                        // The session was already created when HEADERS was first received
+                        if (sessions.TryGetValue(streamId, out args))
+                        {
+                            rr = isClient ? (RequestResponseBase)args.HttpClient.Request : args.HttpClient.Response;
+
+                            var completeHeaderData = pendingMs.ToArray();
+                            pendingHeaderBlocks.Remove(streamId);
+
+                            var headerListener = new MyHeaderListener(
+                                (name, value) =>
+                                {
+                                    var headers = isClient ? args!.HttpClient.Request.Headers : args!.HttpClient.Response.Headers;
+                                    headers.AddHeader(new HttpHeader(name, value));
+                                });
+                            try
+                            {
+                                if (decoder == null || headerTableSize < localSettings.HeaderTableSize)
+                                {
+                                    headerTableSize = localSettings.HeaderTableSize;
+                                    decoder = new Decoder(8192, headerTableSize);
+                                }
+
+                                decoder.Decode(new BinaryReader(new MemoryStream(completeHeaderData)), headerListener);
+                                decoder.EndHeaderBlock();
+
+                                if (rr is Request request)
+                                {
+                                    var method = headerListener.Method;
+                                    var path = headerListener.Path;
+                                    if (method.Length > 0 && path.Length > 0)
+                                    {
+                                        request.HttpVersion = HttpVersion.Version20;
+                                        request.Method = method.GetString();
+                                        request.IsHttps = headerListener.Scheme == ProxyServer.UriSchemeHttps;
+                                        request.Authority = headerListener.Authority;
+                                        request.RequestUriString8 = path;
+                                    }
+                                }
+                                else
+                                {
+                                    var response = (Response)rr;
+                                    response.HttpVersion = HttpVersion.Version20;
+                                    string statusHack = HttpHeader.Encoding.GetString(headerListener.Status.Span);
+                                    int.TryParse(statusHack, out int statusCode);
+                                    response.StatusCode = statusCode;
+                                    response.StatusDescription = string.Empty;
+                                }
+                            }
+                            catch (Exception ex)
+                            {
+                                exceptionFunc?.Invoke(new ProxyHttpException("Failed to decode HTTP/2 CONTINUATION headers", ex, args));
+                            }
+
+                            var tcs = new TaskCompletionSource<bool>();
+                            rr.ReadHttp2BeforeHandlerTaskCompletionSource = tcs;
+
+                            var handler = onBeforeRequestResponse(args);
+                            rr.Http2BeforeHandlerTask = handler;
+
+                            if (handler == await Task.WhenAny(tcs.Task, handler))
+                            {
+                                rr.ReadHttp2BeforeHandlerTaskCompletionSource = null;
+                                tcs.SetResult(true);
+                                await SendHeader(remoteSettings, encoderState, frameHeader, frameHeaderBuffer, rr, false, output, args.IsPromise);
+                            }
+                            else
+                            {
+                                rr.Http2IgnoreBodyFrames = true;
+                            }
+
+                            rr.Locked = true;
+                        }
+                    }
+                    // While waiting for more CONTINUATION frames, don't send this intermediate frame
+                    sendPacket = false;
                 }
+                // ==================== SETTINGS frame ====================
                 else if (type == Http2FrameType.Settings)
                 {
-                    if (length % 6 != 0)
-                    {
-                        // https://httpwg.org/specs/rfc7540.html#SETTINGS
-                        // 6.5. SETTINGS
-                        // A SETTINGS frame with a length other than a multiple of 6 octets MUST be treated as a connection error (Section 5.4.1) of type FRAME_SIZE_ERROR
-                        throw new ProxyHttpException("Invalid settings length", null, null);
-                    }
+                    // Fix Critical: Send SETTINGS ACK (RFC 7540 §6.5)
+                    bool isAck = (flags & Http2FrameFlag.Ack) != 0;
 
-                    int pos = 0;
-                    while (pos < length)
+                    if (!isAck)
                     {
-                        int identifier = (buffer[pos++] << 8) + buffer[pos++];
-                        int value =
- (buffer[pos++] << 24) + (buffer[pos++] << 16) + (buffer[pos++] << 8) + buffer[pos++];
-                        if (identifier == 1 /*SETTINGS_HEADER_TABLE_SIZE*/)
+                        // Parse settings parameters
+                        if (length % 6 != 0)
                         {
-                            //System.Diagnostics.Debug.WriteLine("HEADER SIZE CONN: " + connectionId + ", CLIENT: " + isClient + ", value: " + value);
-                            remoteSettings.HeaderTableSize = value;
+                            // RFC 7540 §6.5: A SETTINGS frame with length not a multiple of 6 octets MUST be treated as FRAME_SIZE_ERROR
+                            throw new ProxyHttpException("Invalid settings length", null, null);
                         }
-                        else if (identifier == 5 /*SETTINGS_MAX_FRAME_SIZE*/)
+
+                        int pos = 0;
+                        while (pos < length)
                         {
-                            remoteSettings.MaxFrameSize = value;
+                            int identifier = (buffer[pos++] << 8) + buffer[pos++];
+                            int value = (buffer[pos++] << 24) + (buffer[pos++] << 16) + (buffer[pos++] << 8) + buffer[pos++];
+
+                            switch (identifier)
+                            {
+                                case 1: // SETTINGS_HEADER_TABLE_SIZE
+                                    remoteSettings.HeaderTableSize = value;
+                                    break;
+                                case 2: // SETTINGS_ENABLE_PUSH
+                                    remoteSettings.EnablePush = value;
+                                    break;
+                                case 3: // SETTINGS_MAX_CONCURRENT_STREAMS
+                                    remoteSettings.MaxConcurrentStreams = value < 0 ? int.MaxValue : value;
+                                    break;
+                                case 4: // SETTINGS_INITIAL_WINDOW_SIZE
+                                    // RFC 7540 §6.9.2: update existing stream windows when INITIAL_WINDOW_SIZE changes
+                                    int delta = value - remoteSettings.InitialWindowSize;
+                                    remoteSettings.InitialWindowSize = value;
+                                    // Update all open stream windows
+                                    foreach (var key in streamWindowSizes.Keys)
+                                    {
+                                        streamWindowSizes[key] += delta;
+                                    }
+                                    break;
+                                case 5: // SETTINGS_MAX_FRAME_SIZE
+                                    remoteSettings.MaxFrameSize = value;
+                                    break;
+                                case 6: // SETTINGS_MAX_HEADER_LIST_SIZE
+                                    remoteSettings.MaxHeaderListSize = value < 0 ? int.MaxValue : value;
+                                    break;
+                            }
                         }
+
+                        // Send SETTINGS ACK back to sender (do not cancel with token – must complete)
+                        // RFC 7540 §6.5: ACK = empty SETTINGS frame (length=0) with flag ACK (0x1)
+                        var ackHeader = new Http2FrameHeader
+                        {
+                            Length = 0,
+                            Type = Http2FrameType.Settings,
+                            Flags = Http2FrameFlag.Ack,
+                            StreamId = 0
+                        };
+                        ackHeader.CopyToBuffer(frameHeaderBuffer);
+                        await output.WriteAsync(frameHeaderBuffer, 0, frameHeaderBuffer.Length);
                     }
+                    // Whether ACK or not, forward the original frame to the other side
+                    // (we just also sent our own ACK to the sender)
                 }
+                // ==================== PING frame ====================
+                // Fix High: Reply to PING frames (RFC 7540 §6.7)
+                else if (type == Http2FrameType.Ping)
+                {
+                    bool isAck = (flags & Http2FrameFlag.Ack) != 0;
 
-                if (type == Http2FrameType.RstStream)
+                    if (!isAck && streamId == 0)
+                    {
+                        // Must reply with PING + ACK flag, same 8-byte payload
+                        var pingHeader = new Http2FrameHeader
+                        {
+                            Length = 8,
+                            Type = Http2FrameType.Ping,
+                            Flags = Http2FrameFlag.Ack,
+                            StreamId = 0
+                        };
+                        pingHeader.CopyToBuffer(frameHeaderBuffer);
+                        await output.WriteAsync(frameHeaderBuffer, 0, frameHeaderBuffer.Length);
+                        await output.WriteAsync(buffer, 0, 8);
+
+                        // Do NOT forward PING to the other side – proxy handles it locally
+                        sendPacket = false;
+                    }
+                    // If it's already an ACK, forward it (it's a response to a PING we sent)
+                }
+                // ==================== WINDOW_UPDATE frame ====================
+                // Fix High: Handle flow control (RFC 7540 §6.9)
+                else if (type == Http2FrameType.WindowUpdate)
+                {
+                    if (length == 4)
+                    {
+                        int increment = ((buffer[0] & 0x7f) << 24) + (buffer[1] << 16) + (buffer[2] << 8) + buffer[3];
+
+                        if (streamId == 0)
+                        {
+                            // Connection-level window update
+                            remoteSettings.ConnectionWindowSize += increment;
+                        }
+                        else
+                        {
+                            // Stream-level window update
+                            if (!streamWindowSizes.TryGetValue(streamId, out int current))
+                                current = remoteSettings.InitialWindowSize;
+                            streamWindowSizes[streamId] = current + increment;
+                        }
+                    }
+                    // Forward the WINDOW_UPDATE to the other side as normal
+                }
+                // ==================== RST_STREAM frame ====================
+                else if (type == Http2FrameType.RstStream)
                 {
                     int errorCode = (buffer[0] << 24) + (buffer[1] << 16) + (buffer[2] << 8) + buffer[3];
                     if (streamId == 0)
                     {
-                        // connection error
+                        // Connection error
                         exceptionFunc?.Invoke(new ProxyHttpException("HTTP/2 connection error. Error code: " + errorCode, null, args));
                         return;
                     }
                     else
                     {
-                        // stream error
+                        // Stream error
                         sessions.TryRemove(streamId, out _);
+                        streamWindowSizes.Remove(streamId);
 
                         if (errorCode != 8 /*cancel*/)
                         {
@@ -368,6 +569,7 @@ namespace Titanium.Web.Proxy.Http2
                     }
                 }
 
+                // ==================== End-of-stream body handling ====================
                 if (endStream && rr!.ReadHttp2BodyTaskCompletionSource != null)
                 {
                     if (!rr.BodyAvailable)
@@ -418,46 +620,54 @@ namespace Titanium.Web.Proxy.Http2
                         Breakpoint();
                     }
 
-                    await SendBody(remoteSettings, rr, frameHeader, frameHeaderBuffer, buffer, output);
+                    await SendBody(remoteSettings, encoderState, rr, frameHeader, frameHeaderBuffer, buffer, output);
                 }
 
                 if (!isClient && endStream)
                 {
                     sessions.TryRemove(streamId, out _);
+                    streamWindowSizes.Remove(streamId);
                     System.Diagnostics.Debug.WriteLine("REMOVED CONN: " + connectionId + ", CLIENT: " + isClient + ", STREAM: " + streamId + ", TYPE: " + type);
                 }
 
                 if (sendPacket)
                 {
-                    // do not cancel the write operation
+                    // Do not cancel the write operation
                     frameHeader.CopyToBuffer(frameHeaderBuffer);
-                    await output.WriteAsync(frameHeaderBuffer, 0, frameHeaderBuffer.Length/*, cancellationToken*/);
-                    await output.WriteAsync(buffer, 0, length /*, cancellationToken*/);
+                    await output.WriteAsync(frameHeaderBuffer, 0, frameHeaderBuffer.Length);
+                    await output.WriteAsync(buffer, 0, length);
                 }
 
                 if (cancellationToken.IsCancellationRequested)
                 {
                     return;
                 }
-
-                /*using (var fs = new System.IO.FileStream($@"c:\temp\{connectionId}.{streamId}.dat", FileMode.Append))
-                {
-                    fs.Write(headerBuffer, 0, headerBuffer.Length);
-                    fs.Write(buffer, 0, length);
-                }*/
             }
         }
 
         [Conditional("DEBUG")]
         private static void Breakpoint()
         {
-            // when this method is called something received which is not yet implemented
+            // When this method is called something received which is not yet implemented
             ;
         }
 
-        private static async Task SendHeader(Http2Settings settings, Http2FrameHeader frameHeader, byte[] frameHeaderBuffer, RequestResponseBase rr, bool endStream, Stream output, bool pushPromise)
+        /// <summary>
+        /// Sends a HEADERS frame (or PUSH_PROMISE) to output, re-encoding headers with HPACK.
+        /// Fix Medium: Uses a stateful Encoder per connection to enable HPACK header table compression.
+        /// </summary>
+        private static async Task SendHeader(Http2Settings settings, EncoderState encoderState,
+            Http2FrameHeader frameHeader, byte[] frameHeaderBuffer,
+            RequestResponseBase rr, bool endStream, Stream output, bool pushPromise)
         {
-            var encoder = new Encoder(settings.HeaderTableSize);
+            // Fix Medium: Reuse encoder (stateful per-connection) instead of new Encoder() each time
+            if (encoderState.Encoder == null || encoderState.HeaderTableSize != settings.HeaderTableSize)
+            {
+                encoderState.HeaderTableSize = settings.HeaderTableSize;
+                encoderState.Encoder = new Encoder(settings.HeaderTableSize);
+            }
+            var encoder = encoderState.Encoder;
+
             var ms = new MemoryStream();
             var writer = new BinaryWriter(ms);
             if (rr.Priority.HasValue)
@@ -509,19 +719,19 @@ namespace Titanium.Web.Proxy.Http2
 
             frameHeader.Flags = flags;
 
-            // clear the padding flag
-            //headerBuffer[4] = (byte)(flags & ~((int)Http2FrameFlag.Padded));
-
-            // send the header
             frameHeader.CopyToBuffer(frameHeaderBuffer);
-            await output.WriteAsync(frameHeaderBuffer, 0, frameHeaderBuffer.Length/*, cancellationToken*/);
-            await output.WriteAsync(data, 0, data.Length /*, cancellationToken*/);
+            await output.WriteAsync(frameHeaderBuffer, 0, frameHeaderBuffer.Length);
+            await output.WriteAsync(data, 0, data.Length);
         }
 
-        private static async Task SendBody(Http2Settings settings, RequestResponseBase rr, Http2FrameHeader frameHeader, byte[] frameHeaderBuffer, byte[] buffer, Stream output)
+        /// <summary>
+        /// Sends the response body, splitting into DATA frames respecting MaxFrameSize.
+        /// </summary>
+        private static async Task SendBody(Http2Settings settings, EncoderState encoderState,
+            RequestResponseBase rr, Http2FrameHeader frameHeader, byte[] frameHeaderBuffer, byte[] buffer, Stream output)
         {
             var body = rr.CompressBodyAndUpdateContentLength();
-            await SendHeader(settings, frameHeader, frameHeaderBuffer, rr, !(rr.HasBody && rr.IsBodyRead), output, false);
+            await SendHeader(settings, encoderState, frameHeader, frameHeaderBuffer, rr, !(rr.HasBody && rr.IsBodyRead), output, false);
 
             if (rr.HasBody && rr.IsBodyRead)
             {
@@ -537,13 +747,9 @@ namespace Titanium.Web.Proxy.Http2
                     frameHeader.Flags = pos < body.Length ? (Http2FrameFlag)0 : Http2FrameFlag.EndStream;
 
                     frameHeader.CopyToBuffer(frameHeaderBuffer);
-                    await output.WriteAsync(frameHeaderBuffer, 0, frameHeaderBuffer.Length/*, cancellationToken*/);
-                    await output.WriteAsync(buffer, 0, bodyFrameLength /*, cancellationToken*/);
+                    await output.WriteAsync(frameHeaderBuffer, 0, frameHeaderBuffer.Length);
+                    await output.WriteAsync(buffer, 0, bodyFrameLength);
                 }
-            }
-            else
-            {
-                ;
             }
         }
 
@@ -567,12 +773,15 @@ namespace Titanium.Web.Proxy.Http2
             return totalRead;
         }
 
-
-        class Http2Settings
+        /// <summary>
+        /// Wrapper class for Encoder to allow stateful per-connection HPACK encoding
+        /// without needing ref parameters in async methods.
+        /// </summary>
+        private class EncoderState
         {
-            public int HeaderTableSize { get; set; } = 4096;
-
-            public int MaxFrameSize { get; set; } = 16384;
+            public Encoder? Encoder { get; set; }
+            /// <summary>The header table size the current Encoder was created with.</summary>
+            public int HeaderTableSize { get; set; } = -1;
         }
 
         class MyHeaderListener : IHeaderListener
