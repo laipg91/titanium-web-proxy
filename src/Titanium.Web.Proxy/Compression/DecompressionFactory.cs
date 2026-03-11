@@ -16,8 +16,13 @@ namespace Titanium.Web.Proxy.Compression
             {
                 HttpCompression.Gzip => new GZipStream(stream, CompressionMode.Decompress, leaveOpen),
                 HttpCompression.Deflate => new DeflateStream(stream, CompressionMode.Decompress, leaveOpen),
+#if NET6_0_OR_GREATER
+                HttpCompression.Brotli =>
+                    new BrotliStream(stream, CompressionMode.Decompress, leaveOpen),
+#else
                 HttpCompression.Brotli =>
                     new BrotliSharpLib.BrotliStream(stream, CompressionMode.Decompress, leaveOpen),
+#endif
                 _ => throw new Exception($"Unsupported decompression mode: {type}")
             };
         }
