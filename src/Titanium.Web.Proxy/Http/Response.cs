@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.ComponentModel;
 using Titanium.Web.Proxy.Exceptions;
 using Titanium.Web.Proxy.Extensions;
@@ -125,7 +125,7 @@ namespace Titanium.Web.Proxy.Http
             var secondSpace = httpStatus.IndexOf(' ', firstSpace + 1);
             if (secondSpace != -1)
             {
-#if NETSTANDARD2_1
+#if NET6_0_OR_GREATER
                 statusCode = int.Parse(httpStatus.AsSpan(firstSpace + 1, secondSpace - firstSpace - 1));
 #else
                 statusCode = int.Parse(httpStatus.AsSpan(firstSpace + 1, secondSpace - firstSpace - 1).ToString());
@@ -134,7 +134,7 @@ namespace Titanium.Web.Proxy.Http
             }
             else
             {
-#if NETSTANDARD2_1
+#if NET6_0_OR_GREATER
                 statusCode = int.Parse(httpStatus.AsSpan(firstSpace + 1));
 #else
                 statusCode = int.Parse(httpStatus.AsSpan(firstSpace + 1).ToString());

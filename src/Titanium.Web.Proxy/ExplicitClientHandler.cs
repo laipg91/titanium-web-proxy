@@ -1,8 +1,9 @@
-﻿using System;
+using System;
 using System.IO;
 using System.Net;
 using System.Net.Security;
 using System.Net.Sockets;
+using System.Security.Authentication;
 using System.Security.Cryptography.X509Certificates;
 using System.Threading;
 using System.Threading.Tasks;
@@ -123,7 +124,17 @@ namespace Titanium.Web.Proxy
                     if (decryptSsl && clientHelloInfo != null)
                     {
                         connectRequest.IsHttps = true; // todo: move this line to the previous "if"
-                        clientStream.Connection.SslProtocol = clientHelloInfo.SslProtocol;
+
+                        // Validate that the client's SSL protocol is supported by this proxy.
+                        // Intersect with SupportedSslProtocols to enforce proxy policy (e.g. block TLS 1.0/SSLv3).
+                        var sslProtocol = clientHelloInfo.SslProtocol & SupportedSslProtocols;
+                        if (sslProtocol == SslProtocols.None)
+                        {
+                            throw new Exception($"Unsupported client SSL version: {clientHelloInfo.SslProtocol}. " +
+                                                $"Proxy supports: {SupportedSslProtocols}");
+                        }
+
+                        clientStream.Connection.SslProtocol = sslProtocol;
 
                         var http2Supported = false;
 
@@ -191,7 +202,7 @@ namespace Titanium.Web.Proxy
                             options.CertificateRevocationCheckMode = X509RevocationMode.NoCheck;
                             await sslStream.AuthenticateAsServerAsync(options, cancellationToken);
 
-#if NETSTANDARD2_1
+#if NET6_0_OR_GREATER
                             clientStream.Connection.NegotiatedApplicationProtocol =
  sslStream.NegotiatedApplicationProtocol;
 #endif
@@ -315,7 +326,7 @@ namespace Titanium.Web.Proxy
                             true, false, cancellationToken))!;
                         try
                         {
-#if NETSTANDARD2_1
+#if NET6_0_OR_GREATER
                             var connectionPreface = new ReadOnlyMemory<byte>(Http2Helper.ConnectionPreface);
                             await connection.Stream.WriteAsync(connectionPreface, cancellationToken);
                             await Http2Helper.SendHttp2(clientStream, connection.Stream,

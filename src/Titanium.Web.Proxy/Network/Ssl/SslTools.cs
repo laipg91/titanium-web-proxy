@@ -1,4 +1,6 @@
-﻿using System.Collections.Generic;
+using System;
+using System.Buffers.Binary;
+using System.Collections.Generic;
 using System.Threading;
 using System.Threading.Tasks;
 using Titanium.Web.Proxy.StreamExtended.BufferPool;
@@ -232,7 +234,6 @@ namespace Titanium.Web.Proxy.StreamExtended
                 if (!await peekStream.EnsureBufferLength(length + 2 + 1, cancellationToken)) return null;
 
                 var sessionId = peekStream.ReadBytes(length);
-
                 var cipherSuite = peekStream.ReadInt16();
                 var compressionMethod = peekStream.ReadByte();
 
@@ -268,16 +269,16 @@ namespace Titanium.Web.Proxy.StreamExtended
 
                     if (await peekStreamReader.EnsureBufferLength(extensionsLength, cancellationToken))
                     {
+                        var extensionsData = peekStreamReader.ReadBytes(extensionsLength).AsMemory();
                         extensions = new Dictionary<string, SslExtension>();
                         var idx = 0;
-                        while (extensionsLength > 3)
+                        while (extensionsData.Length > 3)
                         {
-                            var id = peekStreamReader.ReadInt16();
-                            var length = peekStreamReader.ReadInt16();
-                            var data = peekStreamReader.ReadBytes(length);
-                            var extension = SslExtensions.GetExtension(id, data, idx++);
+                            var id = BinaryPrimitives.ReadInt16BigEndian(extensionsData.Span);
+                            var length = BinaryPrimitives.ReadInt16BigEndian(extensionsData.Span.Slice(2));
+                            var extension = new SslExtension(id, extensionsData.Slice(4, length), idx++);
                             extensions[extension.Name] = extension;
-                            extensionsLength -= 4 + length;
+                            extensionsData = extensionsData.Slice(4 + length);
                         }
                     }
                 }

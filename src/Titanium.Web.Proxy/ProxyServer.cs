@@ -247,7 +247,19 @@ namespace Titanium.Web.Proxy
         /// </summary>
 #pragma warning disable 618
         public SslProtocols SupportedSslProtocols { get; set; } =
-            SslProtocols.Ssl3 | SslProtocols.Tls | SslProtocols.Tls11 | SslProtocols.Tls12;
+            SslProtocols.Ssl3 | SslProtocols.Tls | SslProtocols.Tls11 | SslProtocols.Tls12
+#if NET6_0_OR_GREATER
+            | SslProtocols.Tls13
+#endif
+            ;
+#pragma warning restore 618
+
+        /// <summary>
+        ///     List of supported Server Ssl versions.
+        ///     Using SslProtocol.None means to require the same SSL protocol as the proxy client.
+        /// </summary>
+#pragma warning disable 618
+        public SslProtocols SupportedServerSslProtocols { get; set; } = SslProtocols.None;
 #pragma warning restore 618
 
         /// <summary>

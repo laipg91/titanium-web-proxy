@@ -340,6 +340,8 @@ namespace Titanium.Web.Proxy.Network.Tcp
                     throw new Exception(
                         $"A client is making HTTP request via external proxy to one of the listening ports of this proxy {remoteHostName}:{remotePort}");
 
+            if (proxyServer.SupportedServerSslProtocols != SslProtocols.None) sslProtocol = proxyServer.SupportedServerSslProtocols;
+
             if (isHttps && sslProtocol == SslProtocols.None) sslProtocol = proxyServer.SupportedSslProtocols;
 
             var useUpstreamProxy1 = false;
@@ -592,7 +594,7 @@ namespace Titanium.Web.Proxy.Network.Tcp
                         CertificateRevocationCheckMode = proxyServer.CheckCertificateRevocation
                     };
                     await sslStream.AuthenticateAsClientAsync(options, cancellationToken);
-#if NETSTANDARD2_1
+#if NET6_0_OR_GREATER
                     negotiatedApplicationProtocol = sslStream.NegotiatedApplicationProtocol;
 #endif
 

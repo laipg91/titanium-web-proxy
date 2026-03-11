@@ -1,4 +1,4 @@
-#if NETSTANDARD2_1
+#if NET6_0_OR_GREATER
 namespace Titanium.Web.Proxy.Http2
 {
     /// <summary>

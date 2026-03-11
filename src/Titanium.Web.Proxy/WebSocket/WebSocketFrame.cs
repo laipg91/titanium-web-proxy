@@ -19,7 +19,7 @@ namespace Titanium.Web.Proxy
 
         public string GetText(Encoding encoding)
         {
-#if NETSTANDARD2_1
+#if NET6_0_OR_GREATER
             return encoding.GetString(Data.Span);
 #else
             return encoding.GetString(Data.ToArray());

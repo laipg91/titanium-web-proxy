@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Net;
 using System.Text;
 using Titanium.Web.Proxy.Extensions;
@@ -19,7 +19,7 @@ namespace Titanium.Web.Proxy.Models
         /// </summary>
         public const int HttpHeaderOverhead = 32;
 
-#if NETSTANDARD2_1
+#if NET6_0_OR_GREATER
         internal static Version VersionUnknown => HttpVersion.Unknown;
 #else
         internal static Version VersionUnknown { get; } = new(0, 0);
@@ -29,7 +29,7 @@ namespace Titanium.Web.Proxy.Models
 
         internal static Version Version11 => HttpVersion.Version11;
 
-#if NETSTANDARD2_1
+#if NET6_0_OR_GREATER
         internal static Version Version20 => HttpVersion.Version20;
 #else
         internal static Version Version20 { get; } = new(2, 0);

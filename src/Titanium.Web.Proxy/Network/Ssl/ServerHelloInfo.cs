@@ -1,7 +1,8 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Text;
+using Titanium.Web.Proxy.Extensions;
 using Titanium.Web.Proxy.StreamExtended.Models;
 
 namespace Titanium.Web.Proxy.StreamExtended
@@ -45,8 +46,7 @@ namespace Titanium.Web.Proxy.StreamExtended
                 var time = DateTime.MinValue;
                 if (Random.Length > 3)
                     time = new DateTime(1970, 1, 1, 0, 0, 0, 0, DateTimeKind.Utc)
-                        .AddSeconds(((uint)Random[3] << 24) + ((uint)Random[2] << 16) + ((uint)Random[1] << 8) +
-                                    Random[0])
+                        .AddSeconds(((uint)Random[3] << 24) + ((uint)Random[2] << 16) + ((uint)Random[1] << 8) + Random[0])
                         .ToLocalTime();
 
                 return time;
@@ -95,9 +95,9 @@ namespace Titanium.Web.Proxy.StreamExtended
                 $"A SSLv{HandshakeVersion}-compatible ServerHello handshake was found. Titanium extracted the parameters below.");
             sb.AppendLine();
             sb.AppendLine($"Version: {SslVersionToString(MajorVersion, MinorVersion)}");
-            sb.AppendLine($"Random: {string.Join(" ", Random.Select(x => x.ToString("X2")))}");
+            sb.AppendLine($"Random: {StringExtensions.ByteArrayToHexString(Random)}");
             sb.AppendLine($"\"Time\": {Time}");
-            sb.AppendLine($"SessionID: {string.Join(" ", SessionId.Select(x => x.ToString("X2")))}");
+            sb.AppendLine($"SessionID: {StringExtensions.ByteArrayToHexString(SessionId)}");
 
             if (Extensions != null)
             {

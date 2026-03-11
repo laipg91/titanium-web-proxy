@@ -13,7 +13,7 @@ namespace Titanium.Web.Proxy.Extensions
 
         internal static string GetString(this ReadOnlySpan<byte> bytes)
         {
-#if NETSTANDARD2_1
+#if NET6_0_OR_GREATER
             return HttpHeader.Encoding.GetString(bytes);
 #else
             return HttpHeader.Encoding.GetString(bytes.ToArray());
