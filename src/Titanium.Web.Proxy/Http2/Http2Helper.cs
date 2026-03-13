@@ -1,4 +1,4 @@
-﻿#if NET6_0_OR_GREATER
+#if NET6_0_OR_GREATER
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
@@ -81,6 +81,14 @@ namespace Titanium.Web.Proxy.Http2
             // Stream-level flow control window sizes (High fix)
             // Key: streamId, Value: current window size (initialized from SETTINGS_INITIAL_WINDOW_SIZE)
             var streamWindowSizes = new Dictionary<int, int>();
+
+            // Fix Critical 2: Proxy-local flow control windows.
+            // These track how many bytes the proxy has consumed but not yet acknowledged to the source.
+            // When consumed bytes reach a threshold we send WINDOW_UPDATE back to the source so it can
+            // keep sending, without letting the source flood the proxy's RAM unconstrained.
+            const int WindowUpdateThreshold = 32768; // Send WINDOW_UPDATE after consuming ~32 KB
+            int localConnConsumed = 0;               // bytes consumed from source at connection level
+            var localStreamConsumed = new Dictionary<int, int>(); // per-stream consumed bytes
 
             while (true)
             {
@@ -170,6 +178,15 @@ namespace Titanium.Web.Proxy.Http2
 
                         data!.Write(buffer, offset, dataLength);
                     }
+
+                    // Fix Critical 2: Track proxy-local consumed bytes for flow control.
+                    // After the DATA bytes are consumed (written to rr.Http2BodyData or forwarded),
+                    // accumulate them and send WINDOW_UPDATE back to the source once we cross
+                    // the threshold, so the source knows the proxy is ready for more data.
+                    localConnConsumed += length;
+                    if (!localStreamConsumed.TryGetValue(streamId, out int streamConsumed))
+                        streamConsumed = 0;
+                    localStreamConsumed[streamId] = streamConsumed + length;
                 }
                 // ==================== HEADERS frame ====================
                 else if (type == Http2FrameType.Headers || type == Http2FrameType.PushPromise)
@@ -638,6 +655,25 @@ namespace Titanium.Web.Proxy.Http2
                     await output.WriteAsync(buffer, 0, length);
                 }
 
+                // Fix Critical 2: After writing DATA out, send WINDOW_UPDATE back to source
+                // to tell it the proxy has room for more data (backpressure control).
+                // We batch updates: only send when consumed >= threshold to avoid per-frame overhead.
+                if (type == Http2FrameType.Data && localConnConsumed >= WindowUpdateThreshold)
+                {
+                    // Connection-level WINDOW_UPDATE (stream id = 0)
+                    await SendWindowUpdate(input, frameHeaderBuffer, 0, localConnConsumed, cancellationToken);
+                    localConnConsumed = 0;
+                }
+
+                // Stream-level WINDOW_UPDATE: flush per-stream consumed bytes together with end-of-frame
+                if (type == Http2FrameType.Data && streamId != 0 &&
+                    localStreamConsumed.TryGetValue(streamId, out int toAckStream) &&
+                    toAckStream >= WindowUpdateThreshold)
+                {
+                    await SendWindowUpdate(input, frameHeaderBuffer, streamId, toAckStream, cancellationToken);
+                    localStreamConsumed[streamId] = 0;
+                }
+
                 if (cancellationToken.IsCancellationRequested)
                 {
                     return;
@@ -653,18 +689,63 @@ namespace Titanium.Web.Proxy.Http2
         }
 
         /// <summary>
+        /// Fix Critical 2: Send a WINDOW_UPDATE frame back to the source stream.
+        /// This notifies the source that the proxy has consumed <paramref name="increment"/> bytes
+        /// and has room for that many more, preventing source from stalling or flooding proxy RAM.
+        /// </summary>
+        private static async Task SendWindowUpdate(
+            Stream sourceStream, byte[] frameHeaderBuffer, int streamId, int increment,
+            CancellationToken cancellationToken)
+        {
+            if (increment <= 0) return;
+
+            // WINDOW_UPDATE payload: 4 bytes, high bit reserved (RFC 7540 §6.9)
+            var payload = new byte[4];
+            payload[0] = (byte)((increment >> 24) & 0x7f);
+            payload[1] = (byte)((increment >> 16) & 0xff);
+            payload[2] = (byte)((increment >>  8) & 0xff);
+            payload[3] = (byte)( increment        & 0xff);
+
+            // Build the 9-byte frame header inline
+            var wuHeader = new Http2FrameHeader
+            {
+                Length   = 4,
+                Type     = Http2FrameType.WindowUpdate,
+                Flags    = (Http2FrameFlag)0,
+                StreamId = streamId
+            };
+            wuHeader.CopyToBuffer(frameHeaderBuffer);
+
+            // Write to the SOURCE stream (we are sending backpressure TO whoever sent us data)
+            await sourceStream.WriteAsync(frameHeaderBuffer, 0, frameHeaderBuffer.Length, cancellationToken);
+            await sourceStream.WriteAsync(payload, 0, 4, cancellationToken);
+        }
+
+        /// <summary>
         /// Sends a HEADERS frame (or PUSH_PROMISE) to output, re-encoding headers with HPACK.
-        /// Fix Medium: Uses a stateful Encoder per connection to enable HPACK header table compression.
+        /// Fix Critical 1: Stateful HPACK Encoder — reused per connection, only recreated when
+        /// the remote DECREASES its HeaderTableSize (RFC 7541 §4.2 requires table shrink to be
+        /// signalled and applied immediately). Increasing the table size never requires a new encoder;
+        /// the existing dynamic table simply grows on the next header encoding.
         /// </summary>
         private static async Task SendHeader(Http2Settings settings, EncoderState encoderState,
             Http2FrameHeader frameHeader, byte[] frameHeaderBuffer,
             RequestResponseBase rr, bool endStream, Stream output, bool pushPromise)
         {
-            // Fix Medium: Reuse encoder (stateful per-connection) instead of new Encoder() each time
-            if (encoderState.Encoder == null || encoderState.HeaderTableSize != settings.HeaderTableSize)
+            // Fix Critical 1: Only new Encoder() when:
+            //   a) First use (encoder == null), OR
+            //   b) Remote requests a table SIZE DECREASE → must discard existing dynamic entries (RFC 7541 §4.3).
+            // When size increases: keep existing encoder — the dynamic table will expand naturally.
+            if (encoderState.Encoder == null ||
+                settings.HeaderTableSize < encoderState.HeaderTableSize)
             {
                 encoderState.HeaderTableSize = settings.HeaderTableSize;
                 encoderState.Encoder = new Encoder(settings.HeaderTableSize);
+            }
+            else if (settings.HeaderTableSize > encoderState.HeaderTableSize)
+            {
+                // Size increased: just update the tracked value, no need to recreate encoder.
+                encoderState.HeaderTableSize = settings.HeaderTableSize;
             }
             var encoder = encoderState.Encoder;
 

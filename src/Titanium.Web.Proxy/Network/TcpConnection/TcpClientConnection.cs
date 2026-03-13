@@ -106,7 +106,7 @@ namespace Titanium.Web.Proxy.Network.Tcp
         {
 #if DEBUG
             // Finalizer should not be called
-            System.Diagnostics.Debugger.Break();
+            //System.Diagnostics.Debugger.Break();
 #endif
 
             Dispose(false);

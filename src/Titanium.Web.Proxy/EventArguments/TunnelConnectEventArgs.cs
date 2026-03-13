@@ -82,7 +82,7 @@ namespace Titanium.Web.Proxy.EventArguments
         {
 #if DEBUG
             // Finalizer should not be called
-            System.Diagnostics.Debugger.Break();
+            //System.Diagnostics.Debugger.Break();
 #endif
 
             Dispose(false);

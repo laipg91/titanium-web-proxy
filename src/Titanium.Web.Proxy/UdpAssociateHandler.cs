@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Sockets;
 using System.Threading;
@@ -87,13 +88,16 @@ namespace Titanium.Web.Proxy
                 // Accept UDP from the TCP peer's IP (port may differ — RFC allows 0.0.0.0:0).
                 var tcpPeerAddress = ((IPEndPoint)clientConnection.RemoteEndPoint).Address;
 
-                // Run both relay loops + TCP lifetime monitor concurrently.
+                // Run both relay loops + TCP lifetime monitor + idle timeout concurrently.
                 using (var relayCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken))
                 {
                     await Task.WhenAny(
                         RunRelayLoops(relaySocket, remoteSocket, tcpPeerAddress,
                             clientToRemoteBuf, remoteToClientBuf, relayCts.Token),
-                        MonitorUdpTcpLifetime(tcpStream, relayCts)
+                        MonitorUdpTcpLifetime(tcpStream, relayCts),
+                        // Fix Critical 4: Idle Timeout — auto-close relay if no UDP I/O for 3 minutes.
+                        // Protects against zombie sessions when TCP is in half-open state.
+                        WatchIdleTimeout(TimeSpan.FromMinutes(3), relayCts)
                     );
                     relayCts.Cancel();
                 }
@@ -135,6 +139,8 @@ namespace Titanium.Web.Proxy
         /// <summary>
         ///     Loop A: client → relay → remote.
         ///     SOCKS5 UDP header is stripped via offset (no Array.Copy of payload).
+        ///     Fix Critical 3: Async DNS resolution with in-memory cache (5 min TTL).
+        ///     Fix Critical 4: Updates UdpLastActivityTicks on each successful forward.
         /// </summary>
         private static async Task LoopClientToRemote(
             Socket relaySocket,
@@ -147,6 +153,11 @@ namespace Titanium.Web.Proxy
             EndPoint anyEp = relaySocket.AddressFamily == AddressFamily.InterNetworkV6
                 ? (EndPoint)new IPEndPoint(IPAddress.IPv6Any, 0)
                 : new IPEndPoint(IPAddress.Any, 0);
+
+            // Fix Critical 3: DNS cache to avoid repeated async DNS lookups for the same host.
+            // Key: hostname, Value: DnsCacheEntry (compatible with net461 — no ValueTuple)
+            var dnsCache = new ConcurrentDictionary<string, DnsCacheEntry>();
+            var dnsCacheTtlTicks = TimeSpan.FromMinutes(5).Ticks;
 
             while (!ct.IsCancellationRequested)
             {
@@ -165,10 +176,45 @@ namespace Titanium.Web.Proxy
                     // Parse header — operates on buf bytes in-place, no alloc.
                     int headerLen;
                     IPEndPoint destEp;
-                    if (!UdpSocks5Header.TryParse(buf, receivedBytes, out headerLen, out destEp)) continue;
+                    string domainName;
+                    if (!UdpSocks5Header.TryParse(buf, receivedBytes, out headerLen, out destEp, out domainName))
+                        continue;
+
+                    // Fix Critical 3: If ATYP=3 (domain name), resolve DNS asynchronously.
+                    if (domainName != null)
+                    {
+                        IPAddress resolved = null;
+                        var now = DateTime.UtcNow;
+
+                        // Check cache first
+                        if (dnsCache.TryGetValue(domainName, out var cached) &&
+                            now.Ticks < cached.ExpiryTicks)
+                        {
+                            resolved = cached.Address;
+                        }
+                        else
+                        {
+                            // Async DNS — does not block the Thread Pool
+                            try
+                            {
+                                var addrs = await System.Net.Dns.GetHostAddressesAsync(domainName);
+                                if (addrs == null || addrs.Length == 0) continue;
+                                resolved = addrs[0];
+                                dnsCache[domainName] = new DnsCacheEntry(resolved,
+                                    DateTime.UtcNow.Ticks + dnsCacheTtlTicks);
+                            }
+                            catch { continue; } // DNS failure — drop this packet
+                        }
+
+                        // Build the real destEp from resolved IP + port already in destEp placeholder
+                        destEp = new IPEndPoint(resolved, destEp.Port);
+                    }
 
                     // Send only the payload slice (skips header bytes, no copy).
                     await UdpSocketHelper.SendToAsync(remoteSocket, buf, headerLen, receivedBytes - headerLen, destEp);
+
+                    // Fix Critical 4: Update idle activity timestamp on successful forward.
+                    Interlocked.Exchange(ref UdpLastActivityTicks, DateTime.UtcNow.Ticks);
                 }
                 catch (OperationCanceledException) { break; }
                 catch { /* socket error — keep looping */ }
@@ -243,6 +289,44 @@ namespace Titanium.Web.Proxy
             }
             catch { /* TCP error or cancelled */ }
             finally { relayCts.Cancel(); }
+        }
+
+        // Fix Critical 4: Idle Timeout watcher.
+        // Runs concurrently with the relay loops. If no activity (no packet relayed in either direction)
+        // within the specified timeout window, we cancel the relay CTS.
+        // lastActivityTicks is updated via Interlocked by both LoopA and LoopB each time a packet
+        // is successfully forwarded.
+        internal static long UdpLastActivityTicks; // shared via Interlocked within a single relay session
+
+        private static async Task WatchIdleTimeout(
+            TimeSpan timeout,
+            CancellationTokenSource relayCts)
+        {
+            var start = DateTime.UtcNow;
+            // Initialize last activity to "now" so we give the client a chance to send first packet.
+            Interlocked.Exchange(ref UdpLastActivityTicks, start.Ticks);
+
+            var checkInterval = TimeSpan.FromSeconds(30);
+            try
+            {
+                while (!relayCts.IsCancellationRequested)
+                {
+                    await Task.Delay(checkInterval, relayCts.Token);
+
+                    var lastTicks = Interlocked.Read(ref UdpLastActivityTicks);
+                    var idleFor   = DateTime.UtcNow - new DateTime(lastTicks, DateTimeKind.Utc);
+
+                    if (idleFor >= timeout)
+                    {
+                        // No activity for too long — close the relay to reclaim resources.
+                        System.Diagnostics.Debug.WriteLine(
+                            $"[UDP Associate] Idle timeout ({timeout.TotalMinutes:F0} min) — closing relay.");
+                        relayCts.Cancel();
+                        return;
+                    }
+                }
+            }
+            catch (OperationCanceledException) { /* normal shutdown */ }
         }
 
         // ─────────────────────────────────────────────────────────────────────
@@ -339,11 +423,16 @@ namespace Titanium.Web.Proxy
         /// <summary>
         ///     Parse a SOCKS5 UDP request header from <paramref name="buf"/>[0..<paramref name="len"/>].
         ///     Returns true on success. Allocates one IPEndPoint on success.
+        ///     Fix Critical 3: For ATYP=3 (domain name), sets <paramref name="domainName"/> instead of
+        ///     resolving DNS inline. <paramref name="destEp"/> will be IPAddress.Any:port as a placeholder.
+        ///     Caller must resolve the domain asynchronously if domainName is not null.
         /// </summary>
-        internal static bool TryParse(byte[] buf, int len, out int headerLen, out IPEndPoint destEp)
+        internal static bool TryParse(byte[] buf, int len, out int headerLen, out IPEndPoint destEp,
+            out string domainName)
         {
-            headerLen = 0;
-            destEp    = null;
+            headerLen  = 0;
+            destEp     = null;
+            domainName = null;
 
             if (len < 4)            return false;
             if (buf[0] != 0 || buf[1] != 0) return false; // RSV must be 0
@@ -370,10 +459,11 @@ namespace Titanium.Web.Proxy
                     if (len < needed) return false;
                     var host = System.Text.Encoding.ASCII.GetString(buf, 5, nameLen);
                     port     = (buf[5 + nameLen] << 8) | buf[5 + nameLen + 1];
-                    var addresses = System.Net.Dns.GetHostAddresses(host);
-                    if (addresses.Length == 0) return false;
-                    destEp    = new IPEndPoint(addresses[0], port);
-                    headerLen = needed;
+                    // Fix Critical 3: Return domain name to caller for async DNS resolution.
+                    // Do NOT call Dns.GetHostAddresses (blocking) here.
+                    domainName = host;
+                    destEp     = new IPEndPoint(IPAddress.Any, port); // placeholder port carrier
+                    headerLen  = needed;
                     return true;
 
                 case 4: // IPv6
@@ -411,6 +501,26 @@ namespace Titanium.Web.Proxy
             buf[idx++] = (byte)(sourceEp.Port & 0xFF);
 
             return idx; // header length
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // DNS cache entry (net461-compatible, no ValueTuple dependency)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Immutable DNS cache entry used by <see cref="UdpSocks5Header"/> resolver.
+    /// Avoids C# 7 ValueTuple to remain compatible with net461 without NuGet dependency.
+    /// </summary>
+    internal sealed class DnsCacheEntry
+    {
+        internal readonly IPAddress Address;
+        internal readonly long ExpiryTicks; // DateTime.UtcNow.Ticks at expiry
+
+        internal DnsCacheEntry(IPAddress address, long expiryTicks)
+        {
+            Address     = address;
+            ExpiryTicks = expiryTicks;
         }
     }
 }
