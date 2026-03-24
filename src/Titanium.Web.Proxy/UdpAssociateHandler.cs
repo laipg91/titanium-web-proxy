@@ -64,6 +64,8 @@ namespace Titanium.Web.Proxy
             Socket remoteSocket = null;
             byte[] clientToRemoteBuf = null;
             byte[] remoteToClientBuf = null;
+            UdpSocketAwaitable relayAwaitable  = null;
+            UdpSocketAwaitable remoteAwaitable = null;
 
             try
             {
@@ -89,12 +91,17 @@ namespace Titanium.Web.Proxy
                 // Accept UDP from the TCP peer's IP (port may differ — RFC allows 0.0.0.0:0).
                 var tcpPeerAddress = ((IPEndPoint)clientConnection.RemoteEndPoint).Address;
 
+                // Fix 6: Pre-allocate reusable socket awaitables (one per direction)
+                relayAwaitable  = new UdpSocketAwaitable(af);
+                remoteAwaitable = new UdpSocketAwaitable(af);
+
                 // Run both relay loops + TCP lifetime monitor + idle timeout concurrently.
                 using (var relayCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken))
                 {
                     await Task.WhenAny(
                         RunRelayLoops(relaySocket, remoteSocket, tcpPeerAddress,
-                            clientToRemoteBuf, remoteToClientBuf, endPoint.EnableUdpSsrfFilter, relayCts.Token),
+                            clientToRemoteBuf, remoteToClientBuf, endPoint.EnableUdpSsrfFilter,
+                            relayAwaitable, remoteAwaitable, relayCts.Token),
                         MonitorUdpTcpLifetime(tcpStream, relayCts),
                         // Fix Critical 4: Idle Timeout — auto-close relay if no UDP I/O for 3 minutes.
                         // Protects against zombie sessions when TCP is in half-open state.
@@ -107,6 +114,8 @@ namespace Titanium.Web.Proxy
             {
                 if (clientToRemoteBuf != null) BufferPool.ReturnBuffer(clientToRemoteBuf);
                 if (remoteToClientBuf != null) BufferPool.ReturnBuffer(remoteToClientBuf);
+                if (relayAwaitable  != null) relayAwaitable.Dispose();
+                if (remoteAwaitable != null) remoteAwaitable.Dispose();
                 if (relaySocket  != null) relaySocket.Dispose();
                 if (remoteSocket != null) remoteSocket.Dispose();
                 if (endPoint.MaxUdpAssociateSessions > 0)
@@ -125,15 +134,19 @@ namespace Titanium.Web.Proxy
             byte[] clientToRemoteBuf,
             byte[] remoteToClientBuf,
             bool enableSsrfFilter,
+            UdpSocketAwaitable relayAwaitable,
+            UdpSocketAwaitable remoteAwaitable,
             CancellationToken ct)
         {
             // lastClientUdpEp: written only by LoopA, read only by LoopB.
             IPEndPoint lastClientUdpEp = null;
 
             var loopA = LoopClientToRemote(relaySocket, remoteSocket, expectedClientAddress,
-                clientToRemoteBuf, enableSsrfFilter, ep => lastClientUdpEp = ep, ct);
+                clientToRemoteBuf, enableSsrfFilter, relayAwaitable, remoteAwaitable,
+                ep => lastClientUdpEp = ep, ct);
             var loopB = LoopRemoteToClient(remoteSocket, relaySocket,
-                remoteToClientBuf, () => lastClientUdpEp, ct);
+                remoteToClientBuf, remoteAwaitable, relayAwaitable,
+                () => lastClientUdpEp, ct);
 
             await Task.WhenAll(loopA, loopB);
         }
@@ -150,12 +163,11 @@ namespace Titanium.Web.Proxy
             IPAddress expectedClientAddress,
             byte[] buf,
             bool enableSsrfFilter,
+            UdpSocketAwaitable recvAwaitable,
+            UdpSocketAwaitable sendAwaitable,
             Action<IPEndPoint> onClientEndPoint,
             CancellationToken ct)
         {
-            EndPoint anyEp = relaySocket.AddressFamily == AddressFamily.InterNetworkV6
-                ? (EndPoint)new IPEndPoint(IPAddress.IPv6Any, 0)
-                : new IPEndPoint(IPAddress.Any, 0);
 
             // Fix Critical 3: DNS cache to avoid repeated async DNS lookups for the same host.
             // Key: hostname, Value: DnsCacheEntry (compatible with net461 — no ValueTuple)
@@ -166,7 +178,7 @@ namespace Titanium.Web.Proxy
             {
                 try
                 {
-                    var recvResult = await UdpSocketHelper.ReceiveFromAsync(relaySocket, buf, 0, buf.Length, anyEp);
+                    var recvResult = await recvAwaitable.ReceiveFromAsync(relaySocket, buf, 0, buf.Length);
                     var receivedBytes = recvResult.ReceivedBytes;
                     var sourceEp     = recvResult.RemoteEp;
 
@@ -221,7 +233,7 @@ namespace Titanium.Web.Proxy
                     }
 
                     // Send only the payload slice (skips header bytes, no copy).
-                    await UdpSocketHelper.SendToAsync(remoteSocket, buf, headerLen, receivedBytes - headerLen, destEp);
+                    await sendAwaitable.SendToAsync(remoteSocket, buf, headerLen, receivedBytes - headerLen, destEp);
 
                     // Fix Critical 4: Update idle activity timestamp on successful forward.
                     Interlocked.Exchange(ref UdpLastActivityTicks, DateTime.UtcNow.Ticks);
@@ -240,12 +252,11 @@ namespace Titanium.Web.Proxy
             Socket remoteSocket,
             Socket relaySocket,
             byte[] buf,
+            UdpSocketAwaitable recvAwaitable,
+            UdpSocketAwaitable sendAwaitable,
             Func<IPEndPoint> getClientEp,
             CancellationToken ct)
         {
-            EndPoint anyEp = remoteSocket.AddressFamily == AddressFamily.InterNetworkV6
-                ? (EndPoint)new IPEndPoint(IPAddress.IPv6Any, 0)
-                : new IPEndPoint(IPAddress.Any, 0);
 
             var offset = UdpSocks5Header.MaxHeaderSize; // slot for worst-case header
 
@@ -261,8 +272,8 @@ namespace Titanium.Web.Proxy
                     }
 
                     // Receive payload starting at offset (header prefix reserved).
-                    var recvResult = await UdpSocketHelper.ReceiveFromAsync(
-                        remoteSocket, buf, offset, buf.Length - offset, anyEp);
+                    var recvResult = await recvAwaitable.ReceiveFromAsync(
+                        remoteSocket, buf, offset, buf.Length - offset);
                     var receivedBytes = recvResult.ReceivedBytes;
                     var sourceEp     = recvResult.RemoteEp;
 
@@ -273,7 +284,7 @@ namespace Titanium.Web.Proxy
                     if (headerLen < offset)
                         Buffer.BlockCopy(buf, offset, buf, headerLen, receivedBytes);
 
-                    await UdpSocketHelper.SendToAsync(relaySocket, buf, 0, headerLen + receivedBytes, clientEp);
+                    await sendAwaitable.SendToAsync(relaySocket, buf, 0, headerLen + receivedBytes, clientEp);
                 }
                 catch (OperationCanceledException) { break; }
                 catch { /* socket error — keep looping */ }
@@ -364,173 +375,6 @@ namespace Titanium.Web.Proxy
         {
             var reply = new byte[] { 5, repCode, 0, 1, 0, 0, 0, 0, 0, 0 };
             await stream.WriteAsync(reply, 0, reply.Length, ct);
-        }
-    }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // Cross-target UDP socket helpers
-    // ─────────────────────────────────────────────────────────────────────────
-
-    /// <summary>
-    ///     APM-based wrappers around BeginReceiveFrom / BeginSendTo.
-    ///     Works on net451 / net461 / netstandard2.0 / netstandard2.1.
-    ///     Using struct result to avoid heap allocation on hot path.
-    /// </summary>
-    internal static class UdpSocketHelper
-    {
-        internal struct RecvResult
-        {
-            internal int ReceivedBytes;
-            internal IPEndPoint RemoteEp;
-        }
-
-        internal static Task<RecvResult> ReceiveFromAsync(
-            Socket socket, byte[] buf, int offset, int size, EndPoint remoteEp)
-        {
-            var tcs = new TaskCompletionSource<RecvResult>();
-            socket.BeginReceiveFrom(buf, offset, size, SocketFlags.None, ref remoteEp, ar =>
-            {
-                try
-                {
-                    var received = socket.EndReceiveFrom(ar, ref remoteEp);
-                    tcs.TrySetResult(new RecvResult { ReceivedBytes = received, RemoteEp = (IPEndPoint)remoteEp });
-                }
-                catch (Exception ex) { tcs.TrySetException(ex); }
-            }, null);
-            return tcs.Task;
-        }
-
-        internal static Task SendToAsync(Socket socket, byte[] buf, int offset, int size, EndPoint remoteEp)
-        {
-            var tcs = new TaskCompletionSource<bool>();
-            socket.BeginSendTo(buf, offset, size, SocketFlags.None, remoteEp, ar =>
-            {
-                try { socket.EndSendTo(ar); tcs.TrySetResult(true); }
-                catch (Exception ex) { tcs.TrySetException(ex); }
-            }, null);
-            return tcs.Task;
-        }
-    }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // SOCKS5 UDP header parser / writer
-    // ─────────────────────────────────────────────────────────────────────────
-
-    /// <summary>
-    ///     SOCKS5 UDP header (RFC 1928 §7):
-    ///     RSV(2) + FRAG(1) + ATYP(1) + DST.ADDR(var) + DST.PORT(2)
-    ///
-    ///     All methods accept plain byte[] with offset to avoid Span on older targets.
-    /// </summary>
-    internal static class UdpSocks5Header
-    {
-        /// <summary>Minimum header (IPv4): 10 bytes.</summary>
-        internal const int MinSize = 10;
-
-        /// <summary>Maximum header (IPv6): 22 bytes.</summary>
-        internal const int MaxHeaderSize = 22;
-
-        /// <summary>
-        ///     Parse a SOCKS5 UDP request header from <paramref name="buf"/>[0..<paramref name="len"/>].
-        ///     Returns true on success. Allocates one IPEndPoint on success.
-        ///     Fix Critical 3: For ATYP=3 (domain name), sets <paramref name="domainName"/> instead of
-        ///     resolving DNS inline. <paramref name="destEp"/> will be IPAddress.Any:port as a placeholder.
-        ///     Caller must resolve the domain asynchronously if domainName is not null.
-        /// </summary>
-        internal static bool TryParse(byte[] buf, int len, out int headerLen, out IPEndPoint destEp,
-            out string domainName)
-        {
-            headerLen  = 0;
-            destEp     = null;
-            domainName = null;
-
-            if (len < 4)            return false;
-            if (buf[0] != 0 || buf[1] != 0) return false; // RSV must be 0
-            if (buf[2] != 0)        return false;          // Reject fragmented datagrams
-
-            var atyp = buf[3];
-            int port;
-
-            switch (atyp)
-            {
-                case 1: // IPv4
-                    if (len < 10) return false;
-                    var ipv4 = new byte[4];
-                    Buffer.BlockCopy(buf, 4, ipv4, 0, 4);
-                    port   = (buf[8] << 8) | buf[9];
-                    destEp = new IPEndPoint(new IPAddress(ipv4), port);
-                    headerLen = 10;
-                    return true;
-
-                case 3: // Domain name
-                    if (len < 5) return false;
-                    var nameLen = buf[4];
-                    var needed  = 5 + nameLen + 2;
-                    if (len < needed) return false;
-                    var host = System.Text.Encoding.ASCII.GetString(buf, 5, nameLen);
-                    port     = (buf[5 + nameLen] << 8) | buf[5 + nameLen + 1];
-                    // Fix Critical 3: Return domain name to caller for async DNS resolution.
-                    // Do NOT call Dns.GetHostAddresses (blocking) here.
-                    domainName = host;
-                    destEp     = new IPEndPoint(IPAddress.Any, port); // placeholder port carrier
-                    headerLen  = needed;
-                    return true;
-
-                case 4: // IPv6
-                    if (len < 22) return false;
-                    var ipv6 = new byte[16];
-                    Buffer.BlockCopy(buf, 4, ipv6, 0, 16);
-                    port   = (buf[20] << 8) | buf[21];
-                    destEp = new IPEndPoint(new IPAddress(ipv6), port);
-                    headerLen = 22;
-                    return true;
-
-                default:
-                    return false;
-            }
-        }
-
-        /// <summary>
-        ///     Write a SOCKS5 UDP response header for <paramref name="sourceEp"/> into
-        ///     <paramref name="buf"/> starting at index 0.
-        ///     Returns number of bytes written (≤ <see cref="MaxHeaderSize"/>).
-        /// </summary>
-        internal static int Write(byte[] buf, int bufSize, IPEndPoint sourceEp)
-        {
-            buf[0] = 0; // RSV
-            buf[1] = 0; // RSV
-            buf[2] = 0; // FRAG
-
-            var addrBytes = sourceEp.Address.GetAddressBytes();
-            var isIpv6    = sourceEp.AddressFamily == AddressFamily.InterNetworkV6;
-            buf[3] = isIpv6 ? (byte)4 : (byte)1; // ATYP
-
-            Buffer.BlockCopy(addrBytes, 0, buf, 4, addrBytes.Length);
-            var idx = 4 + addrBytes.Length;
-            buf[idx++] = (byte)(sourceEp.Port >> 8);
-            buf[idx++] = (byte)(sourceEp.Port & 0xFF);
-
-            return idx; // header length
-        }
-    }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // DNS cache entry (net461-compatible, no ValueTuple dependency)
-    // ─────────────────────────────────────────────────────────────────────────
-
-    /// <summary>
-    /// Immutable DNS cache entry used by <see cref="UdpSocks5Header"/> resolver.
-    /// Avoids C# 7 ValueTuple to remain compatible with net461 without NuGet dependency.
-    /// </summary>
-    internal sealed class DnsCacheEntry
-    {
-        internal readonly IPAddress Address;
-        internal readonly long ExpiryTicks; // DateTime.UtcNow.Ticks at expiry
-
-        internal DnsCacheEntry(IPAddress address, long expiryTicks)
-        {
-            Address     = address;
-            ExpiryTicks = expiryTicks;
         }
     }
 }
