@@ -1,4 +1,4 @@
-﻿using System.Diagnostics;
+using System.Diagnostics;
 using System.Net;
 using System.Threading.Tasks;
 using Titanium.Web.Proxy.EventArguments;
@@ -49,6 +49,13 @@ namespace Titanium.Web.Proxy.Models
         ///     Defaults to false for backward compatibility.
         /// </summary>
         public bool EnableUdpAssociate { get; set; } = false;
+
+        /// <summary>
+        ///     Enable SSRF protection for UDP proxying.
+        ///     Blocks resolving to and forwarding to internal IP addresses (e.g. 192.168.x.x, 127.0.0.1).
+        ///     Defaults to true for security. 
+        /// </summary>
+        public bool EnableUdpSsrfFilter { get; set; } = true;
 
         /// <summary>
         ///     Maximum number of concurrent UDP relay sessions.

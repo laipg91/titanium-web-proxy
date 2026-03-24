@@ -6,6 +6,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using Titanium.Web.Proxy.Models;
 using Titanium.Web.Proxy.Network.Tcp;
+using Titanium.Web.Proxy.Extensions;
 
 namespace Titanium.Web.Proxy
 {
@@ -93,7 +94,7 @@ namespace Titanium.Web.Proxy
                 {
                     await Task.WhenAny(
                         RunRelayLoops(relaySocket, remoteSocket, tcpPeerAddress,
-                            clientToRemoteBuf, remoteToClientBuf, relayCts.Token),
+                            clientToRemoteBuf, remoteToClientBuf, endPoint.EnableUdpSsrfFilter, relayCts.Token),
                         MonitorUdpTcpLifetime(tcpStream, relayCts),
                         // Fix Critical 4: Idle Timeout — auto-close relay if no UDP I/O for 3 minutes.
                         // Protects against zombie sessions when TCP is in half-open state.
@@ -123,13 +124,14 @@ namespace Titanium.Web.Proxy
             IPAddress expectedClientAddress,
             byte[] clientToRemoteBuf,
             byte[] remoteToClientBuf,
+            bool enableSsrfFilter,
             CancellationToken ct)
         {
             // lastClientUdpEp: written only by LoopA, read only by LoopB.
             IPEndPoint lastClientUdpEp = null;
 
             var loopA = LoopClientToRemote(relaySocket, remoteSocket, expectedClientAddress,
-                clientToRemoteBuf, ep => lastClientUdpEp = ep, ct);
+                clientToRemoteBuf, enableSsrfFilter, ep => lastClientUdpEp = ep, ct);
             var loopB = LoopRemoteToClient(remoteSocket, relaySocket,
                 remoteToClientBuf, () => lastClientUdpEp, ct);
 
@@ -147,6 +149,7 @@ namespace Titanium.Web.Proxy
             Socket remoteSocket,
             IPAddress expectedClientAddress,
             byte[] buf,
+            bool enableSsrfFilter,
             Action<IPEndPoint> onClientEndPoint,
             CancellationToken ct)
         {
@@ -208,6 +211,13 @@ namespace Titanium.Web.Proxy
 
                         // Build the real destEp from resolved IP + port already in destEp placeholder
                         destEp = new IPEndPoint(resolved, destEp.Port);
+                    }
+
+                    // Fix 5: SSRF filter - Drop local/private network loops if enabled
+                    if (enableSsrfFilter && destEp.Address.IsInternal())
+                    {
+                        System.Diagnostics.Debug.WriteLine($"[UDP Associate] SSRF Filter blocked internal IP: {destEp.Address}");
+                        continue;
                     }
 
                     // Send only the payload slice (skips header bytes, no copy).
