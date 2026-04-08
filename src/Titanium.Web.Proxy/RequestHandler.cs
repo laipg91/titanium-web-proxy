@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Net.Security;
@@ -10,6 +10,10 @@ using Titanium.Web.Proxy.Exceptions;
 using Titanium.Web.Proxy.Extensions;
 using Titanium.Web.Proxy.Helpers;
 using Titanium.Web.Proxy.Http;
+#if NET6_0_OR_GREATER
+using Titanium.Web.Proxy.Http2;
+using Titanium.Web.Proxy.Http2.Translation;
+#endif
 using Titanium.Web.Proxy.Models;
 using Titanium.Web.Proxy.Network;
 using Titanium.Web.Proxy.Network.Tcp;
@@ -252,8 +256,23 @@ namespace Titanium.Web.Proxy
 
             if (noCache) serverConnection = null;
 
+            // Scenario A (Fix 7): when EnableHttp2=true and HTTPS, offer both h2 and http/1.1 to server.
+            // If server negotiates H2 while client is H1, Http1ToHttp2Translator takes over.
+            // Q2 decision: no h2c (plaintext), only TLS, so guard args.IsHttps.
+#if NET6_0_OR_GREATER
+            var serverAlpn = EnableHttp2 && args.IsHttps && !noCache
+                ? SslExtensions.Http2AndHttp11Protocols
+                : (List<SslApplicationProtocol>?)null;
+#endif
+
             // a connection generator task with captured parameters via closure.
             Func<Task<TcpServerConnection>> generator = () =>
+#if NET6_0_OR_GREATER
+                serverAlpn != null
+                    ? TcpConnectionFactory.GetServerConnection(this, args, false, serverAlpn,
+                                                               noCache, false, cancellationToken)!
+                    :
+#endif
                 TcpConnectionFactory.GetServerConnection(this,
                     args,
                     false,
@@ -285,6 +304,37 @@ namespace Titanium.Web.Proxy
                         cancellationToken);
                     return false;
                 }
+
+#if NET6_0_OR_GREATER
+                // Scenario A: H1 client + H2 server → translate
+                var clientIsH1 = sslApplicationProtocol != SslApplicationProtocol.Http2;
+                var serverIsH2 = connection.NegotiatedApplicationProtocol == SslApplicationProtocol.Http2;
+
+                if (clientIsH1 && serverIsH2)
+                {
+                    // Send HTTP/2 connection preface to server before translator starts its loops
+                    var preface = new ReadOnlyMemory<byte>(Http2Helper.ConnectionPreface);
+                    await connection.Stream.WriteAsync(preface, cancellationToken);
+
+                    IHttp2Translator translator = new Http1ToHttp2Translator();
+                    await translator.TranslateAsync(
+                        args.ClientStream,
+                        connection.Stream,
+                        args,   // Bug #1 Fix: pass already-parsed first request instead of creating new session
+                        () => new SessionEventArgs(this, args.LocalEndPoint, args.ClientStream,
+                            args.HttpClient.ConnectRequest, cancellationTokenSource)
+                        {
+                            UserData = args.UserData
+                        },
+                        async a => await OnBeforeRequest(a),
+                        async a => await OnBeforeResponse(a),
+                        cancellationTokenSource,
+                        args.ClientConnection.Id,
+                        ExceptionFunc);
+
+                    return false; // stop keep-alive loop — translator handled it internally
+                }
+#endif
 
                 // construct the web request that we are going to issue on behalf of the client.
                 await HandleHttpSessionRequest(args);

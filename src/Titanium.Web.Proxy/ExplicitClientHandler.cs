@@ -13,6 +13,9 @@ using Titanium.Web.Proxy.Extensions;
 using Titanium.Web.Proxy.Helpers;
 using Titanium.Web.Proxy.Http;
 using Titanium.Web.Proxy.Http2;
+#if NET6_0_OR_GREATER
+using Titanium.Web.Proxy.Http2.Translation;
+#endif
 using Titanium.Web.Proxy.Models;
 using Titanium.Web.Proxy.Network.Tcp;
 using Titanium.Web.Proxy.StreamExtended;
@@ -329,14 +332,38 @@ namespace Titanium.Web.Proxy
 #if NET6_0_OR_GREATER
                             var connectionPreface = new ReadOnlyMemory<byte>(Http2Helper.ConnectionPreface);
                             await connection.Stream.WriteAsync(connectionPreface, cancellationToken);
-                            await Http2Helper.SendHttp2(clientStream, connection.Stream,
-                                () => new SessionEventArgs(this, endPoint, clientStream, connectArgs?.HttpClient.ConnectRequest, cancellationTokenSource)
-                                {
-                                    UserData = connectArgs?.UserData
-                                },
-                                async args => { await OnBeforeRequest(args); },
-                                async args => { await OnBeforeResponse(args); },
-                                connectArgs.CancellationTokenSource, clientStream.Connection.Id, ExceptionFunc);
+
+                            // Check whether server actually negotiated H2
+                            var serverSpeaksH2 = connection.NegotiatedApplicationProtocol ==
+                                                 SslApplicationProtocol.Http2;
+
+                            if (serverSpeaksH2)
+                            {
+                                // H2↔H2 tunnel — existing path unchanged
+                                await Http2Helper.SendHttp2(clientStream, connection.Stream,
+                                    () => new SessionEventArgs(this, endPoint, clientStream, connectArgs?.HttpClient.ConnectRequest, cancellationTokenSource)
+                                    {
+                                        UserData = connectArgs?.UserData
+                                    },
+                                    async args => { await OnBeforeRequest(args); },
+                                    async args => { await OnBeforeResponse(args); },
+                                    connectArgs.CancellationTokenSource, clientStream.Connection.Id, ExceptionFunc);
+                            }
+                            else
+                            {
+                                // Scenario B: H2 client + H1 server → serialize translator
+                                IHttp2Translator translator = new Http2ToHttp1Translator();
+                                await translator.TranslateAsync(
+                                    clientStream, connection.Stream,
+                                    null,  // Scenario B: no pre-parsed H1 request (H2 client sends preface directly)
+                                    () => new SessionEventArgs(this, endPoint, clientStream, connectArgs?.HttpClient.ConnectRequest, cancellationTokenSource)
+                                    {
+                                        UserData = connectArgs?.UserData
+                                    },
+                                    async args => { await OnBeforeRequest(args); },
+                                    async args => { await OnBeforeResponse(args); },
+                                    connectArgs.CancellationTokenSource, clientStream.Connection.Id, ExceptionFunc);
+                            }
 #endif
                         }
                         finally

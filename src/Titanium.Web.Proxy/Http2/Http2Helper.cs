@@ -14,6 +14,7 @@ using Titanium.Web.Proxy.Exceptions;
 using Titanium.Web.Proxy.Extensions;
 using Titanium.Web.Proxy.Http;
 using Titanium.Web.Proxy.Http2.Hpack;
+using Titanium.Web.Proxy.Http2.Primitives;
 using Titanium.Web.Proxy.Models;
 using Decoder = Titanium.Web.Proxy.Http2.Hpack.Decoder;
 using Encoder = Titanium.Web.Proxy.Http2.Hpack.Encoder;
@@ -68,7 +69,7 @@ namespace Titanium.Web.Proxy.Http2
 
             // Stateful encoder per connection direction (Medium fix: reuse encoder for HPACK compression)
             // Note: EncoderState wrapper used because async methods cannot have ref parameters.
-            var encoderState = new EncoderState();
+            var encoderState = new Http2EncoderState();
 
             var frameHeader = new Http2FrameHeader();
             var frameHeaderBuffer = new byte[9];
@@ -92,7 +93,7 @@ namespace Titanium.Web.Proxy.Http2
 
             while (true)
             {
-                int read = await ForceRead(input, frameHeaderBuffer, 0, 9, cancellationToken);
+                int read = await Http2FrameReader.ForceReadAsync(input, frameHeaderBuffer, 0, 9, cancellationToken);
                 if (read != 9)
                 {
                     return;
@@ -114,7 +115,7 @@ namespace Titanium.Web.Proxy.Http2
                     buffer = new byte[localSettings.MaxFrameSize];
                 }
 
-                read = await ForceRead(input, buffer, 0, length, cancellationToken);
+                read = await Http2FrameReader.ForceReadAsync(input, buffer, 0, length, cancellationToken);
                 if (read != length)
                 {
                     return;
@@ -338,7 +339,7 @@ namespace Titanium.Web.Proxy.Http2
                         {
                             rr.ReadHttp2BeforeHandlerTaskCompletionSource = null;
                             tcs.SetResult(true);
-                            await SendHeader(remoteSettings, encoderState, frameHeader, frameHeaderBuffer, rr, endStream, output, args!.IsPromise);
+                            await Http2FrameWriter.SendHeadersAsync(remoteSettings, encoderState, frameHeader, frameHeaderBuffer, rr, endStream, output, args!.IsPromise, cancellationToken);
                         }
                         else
                         {
@@ -436,7 +437,7 @@ namespace Titanium.Web.Proxy.Http2
                             {
                                 rr.ReadHttp2BeforeHandlerTaskCompletionSource = null;
                                 tcs.SetResult(true);
-                                await SendHeader(remoteSettings, encoderState, frameHeader, frameHeaderBuffer, rr, false, output, args.IsPromise);
+                                await Http2FrameWriter.SendHeadersAsync(remoteSettings, encoderState, frameHeader, frameHeaderBuffer, rr, false, output, args.IsPromise, cancellationToken);
                             }
                             else
                             {
@@ -500,17 +501,8 @@ namespace Titanium.Web.Proxy.Http2
                             }
                         }
 
-                        // Send SETTINGS ACK back to sender (do not cancel with token – must complete)
-                        // RFC 7540 §6.5: ACK = empty SETTINGS frame (length=0) with flag ACK (0x1)
-                        var ackHeader = new Http2FrameHeader
-                        {
-                            Length = 0,
-                            Type = Http2FrameType.Settings,
-                            Flags = Http2FrameFlag.Ack,
-                            StreamId = 0
-                        };
-                        ackHeader.CopyToBuffer(frameHeaderBuffer);
-                        await output.WriteAsync(frameHeaderBuffer, 0, frameHeaderBuffer.Length);
+                        // Send SETTINGS ACK back (RFC 7540 §6.5)
+                        await Http2FrameWriter.SendSettingsAckAsync(output, frameHeaderBuffer, cancellationToken);
                     }
                     // Whether ACK or not, forward the original frame to the other side
                     // (we just also sent our own ACK to the sender)
@@ -523,19 +515,8 @@ namespace Titanium.Web.Proxy.Http2
 
                     if (!isAck && streamId == 0)
                     {
-                        // Must reply with PING + ACK flag, same 8-byte payload
-                        var pingHeader = new Http2FrameHeader
-                        {
-                            Length = 8,
-                            Type = Http2FrameType.Ping,
-                            Flags = Http2FrameFlag.Ack,
-                            StreamId = 0
-                        };
-                        pingHeader.CopyToBuffer(frameHeaderBuffer);
-                        await output.WriteAsync(frameHeaderBuffer, 0, frameHeaderBuffer.Length);
-                        await output.WriteAsync(buffer, 0, 8);
-
-                        // Do NOT forward PING to the other side – proxy handles it locally
+                        // Reply with PING + ACK flag, same 8-byte payload
+                        await Http2FrameWriter.SendPingAckAsync(output, frameHeaderBuffer, buffer[..8], cancellationToken);
                         sendPacket = false;
                     }
                     // If it's already an ACK, forward it (it's a response to a PING we sent)
@@ -637,7 +618,7 @@ namespace Titanium.Web.Proxy.Http2
                         Breakpoint();
                     }
 
-                    await SendBody(remoteSettings, encoderState, rr, frameHeader, frameHeaderBuffer, buffer, output);
+                    await Http2FrameWriter.SendBodyAsync(remoteSettings, encoderState, rr, frameHeader, frameHeaderBuffer, buffer, output, cancellationToken);
                 }
 
                 if (!isClient && endStream)
@@ -661,7 +642,7 @@ namespace Titanium.Web.Proxy.Http2
                 if (type == Http2FrameType.Data && localConnConsumed >= WindowUpdateThreshold)
                 {
                     // Connection-level WINDOW_UPDATE (stream id = 0)
-                    await SendWindowUpdate(input, frameHeaderBuffer, 0, localConnConsumed, cancellationToken);
+                    await Http2FrameWriter.SendWindowUpdateAsync(input, frameHeaderBuffer, 0, localConnConsumed, cancellationToken);
                     localConnConsumed = 0;
                 }
 
@@ -670,7 +651,7 @@ namespace Titanium.Web.Proxy.Http2
                     localStreamConsumed.TryGetValue(streamId, out int toAckStream) &&
                     toAckStream >= WindowUpdateThreshold)
                 {
-                    await SendWindowUpdate(input, frameHeaderBuffer, streamId, toAckStream, cancellationToken);
+                    await Http2FrameWriter.SendWindowUpdateAsync(input, frameHeaderBuffer, streamId, toAckStream, cancellationToken);
                     localStreamConsumed[streamId] = 0;
                 }
 
@@ -686,183 +667,6 @@ namespace Titanium.Web.Proxy.Http2
         {
             // When this method is called something received which is not yet implemented
             ;
-        }
-
-        /// <summary>
-        /// Fix Critical 2: Send a WINDOW_UPDATE frame back to the source stream.
-        /// This notifies the source that the proxy has consumed <paramref name="increment"/> bytes
-        /// and has room for that many more, preventing source from stalling or flooding proxy RAM.
-        /// </summary>
-        private static async Task SendWindowUpdate(
-            Stream sourceStream, byte[] frameHeaderBuffer, int streamId, int increment,
-            CancellationToken cancellationToken)
-        {
-            if (increment <= 0) return;
-
-            // WINDOW_UPDATE payload: 4 bytes, high bit reserved (RFC 7540 §6.9)
-            var payload = new byte[4];
-            payload[0] = (byte)((increment >> 24) & 0x7f);
-            payload[1] = (byte)((increment >> 16) & 0xff);
-            payload[2] = (byte)((increment >>  8) & 0xff);
-            payload[3] = (byte)( increment        & 0xff);
-
-            // Build the 9-byte frame header inline
-            var wuHeader = new Http2FrameHeader
-            {
-                Length   = 4,
-                Type     = Http2FrameType.WindowUpdate,
-                Flags    = (Http2FrameFlag)0,
-                StreamId = streamId
-            };
-            wuHeader.CopyToBuffer(frameHeaderBuffer);
-
-            // Write to the SOURCE stream (we are sending backpressure TO whoever sent us data)
-            await sourceStream.WriteAsync(frameHeaderBuffer, 0, frameHeaderBuffer.Length, cancellationToken);
-            await sourceStream.WriteAsync(payload, 0, 4, cancellationToken);
-        }
-
-        /// <summary>
-        /// Sends a HEADERS frame (or PUSH_PROMISE) to output, re-encoding headers with HPACK.
-        /// Fix Critical 1: Stateful HPACK Encoder — reused per connection, only recreated when
-        /// the remote DECREASES its HeaderTableSize (RFC 7541 §4.2 requires table shrink to be
-        /// signalled and applied immediately). Increasing the table size never requires a new encoder;
-        /// the existing dynamic table simply grows on the next header encoding.
-        /// </summary>
-        private static async Task SendHeader(Http2Settings settings, EncoderState encoderState,
-            Http2FrameHeader frameHeader, byte[] frameHeaderBuffer,
-            RequestResponseBase rr, bool endStream, Stream output, bool pushPromise)
-        {
-            // Fix Critical 1: Only new Encoder() when:
-            //   a) First use (encoder == null), OR
-            //   b) Remote requests a table SIZE DECREASE → must discard existing dynamic entries (RFC 7541 §4.3).
-            // When size increases: keep existing encoder — the dynamic table will expand naturally.
-            if (encoderState.Encoder == null ||
-                settings.HeaderTableSize < encoderState.HeaderTableSize)
-            {
-                encoderState.HeaderTableSize = settings.HeaderTableSize;
-                encoderState.Encoder = new Encoder(settings.HeaderTableSize);
-            }
-            else if (settings.HeaderTableSize > encoderState.HeaderTableSize)
-            {
-                // Size increased: just update the tracked value, no need to recreate encoder.
-                encoderState.HeaderTableSize = settings.HeaderTableSize;
-            }
-            var encoder = encoderState.Encoder;
-
-            var ms = new MemoryStream();
-            var writer = new BinaryWriter(ms);
-            if (rr.Priority.HasValue)
-            {
-                long p = rr.Priority.Value;
-                writer.Write((byte)((p >> 32) & 0xff));
-                writer.Write((byte)((p >> 24) & 0xff));
-                writer.Write((byte)((p >> 16) & 0xff));
-                writer.Write((byte)((p >> 8) & 0xff));
-                writer.Write((byte)(p & 0xff));
-            }
-
-            if (rr is Request request)
-            {
-                var uri = request.RequestUri;
-                encoder.EncodeHeader(writer, StaticTable.KnownHeaderMethod, request.Method.GetByteString());
-                encoder.EncodeHeader(writer, StaticTable.KnownHeaderAuhtority, uri.Authority.GetByteString());
-                encoder.EncodeHeader(writer, StaticTable.KnownHeaderScheme, uri.Scheme.GetByteString());
-                encoder.EncodeHeader(writer, StaticTable.KnownHeaderPath, request.RequestUriString8, false,
-                    HpackUtil.IndexType.None, false);
-            }
-            else
-            {
-                var response = (Response)rr;
-                encoder.EncodeHeader(writer, StaticTable.KnownHeaderStatus, response.StatusCode.ToString().GetByteString());
-            }
-
-            foreach (var header in rr.Headers)
-            {
-                encoder.EncodeHeader(writer, header.NameData, header.ValueData);
-            }
-
-            var data = ms.ToArray();
-            int newLength = data.Length;
-
-            frameHeader.Length = newLength;
-            frameHeader.Type = pushPromise ? Http2FrameType.PushPromise : Http2FrameType.Headers;
-
-            var flags = Http2FrameFlag.EndHeaders;
-            if (endStream)
-            {
-                flags |= Http2FrameFlag.EndStream;
-            }
-
-            if (rr.Priority.HasValue)
-            {
-                flags |= Http2FrameFlag.Priority;
-            }
-
-            frameHeader.Flags = flags;
-
-            frameHeader.CopyToBuffer(frameHeaderBuffer);
-            await output.WriteAsync(frameHeaderBuffer, 0, frameHeaderBuffer.Length);
-            await output.WriteAsync(data, 0, data.Length);
-        }
-
-        /// <summary>
-        /// Sends the response body, splitting into DATA frames respecting MaxFrameSize.
-        /// </summary>
-        private static async Task SendBody(Http2Settings settings, EncoderState encoderState,
-            RequestResponseBase rr, Http2FrameHeader frameHeader, byte[] frameHeaderBuffer, byte[] buffer, Stream output)
-        {
-            var body = rr.CompressBodyAndUpdateContentLength();
-            await SendHeader(settings, encoderState, frameHeader, frameHeaderBuffer, rr, !(rr.HasBody && rr.IsBodyRead), output, false);
-
-            if (rr.HasBody && rr.IsBodyRead)
-            {
-                int pos = 0;
-                while (pos < body!.Length)
-                {
-                    int bodyFrameLength = Math.Min(buffer.Length, body.Length - pos);
-                    Buffer.BlockCopy(body, pos, buffer, 0, bodyFrameLength);
-                    pos += bodyFrameLength;
-
-                    frameHeader.Length = bodyFrameLength;
-                    frameHeader.Type = Http2FrameType.Data;
-                    frameHeader.Flags = pos < body.Length ? (Http2FrameFlag)0 : Http2FrameFlag.EndStream;
-
-                    frameHeader.CopyToBuffer(frameHeaderBuffer);
-                    await output.WriteAsync(frameHeaderBuffer, 0, frameHeaderBuffer.Length);
-                    await output.WriteAsync(buffer, 0, bodyFrameLength);
-                }
-            }
-        }
-
-        private static async Task<int> ForceRead(Stream input, byte[] buffer, int offset, int bytesToRead,
-            CancellationToken cancellationToken)
-        {
-            int totalRead = 0;
-            while (bytesToRead > 0)
-            {
-                int read = await input.ReadAsync(buffer, offset, bytesToRead, cancellationToken);
-                if (read == 0)
-                {
-                    break;
-                }
-
-                totalRead += read;
-                bytesToRead -= read;
-                offset += read;
-            }
-
-            return totalRead;
-        }
-
-        /// <summary>
-        /// Wrapper class for Encoder to allow stateful per-connection HPACK encoding
-        /// without needing ref parameters in async methods.
-        /// </summary>
-        private class EncoderState
-        {
-            public Encoder? Encoder { get; set; }
-            /// <summary>The header table size the current Encoder was created with.</summary>
-            public int HeaderTableSize { get; set; } = -1;
         }
 
         class MyHeaderListener : IHeaderListener

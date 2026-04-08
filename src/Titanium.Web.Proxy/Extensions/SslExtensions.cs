@@ -19,6 +19,13 @@ namespace Titanium.Web.Proxy.Extensions
         internal static readonly List<SslApplicationProtocol> Http2ProtocolAsList =
             new() { SslApplicationProtocol.Http2 };
 
+        /// <summary>
+        /// Used for Scenario A (H1 client → H2 server): offer both H2 and H1.1 to server via ALPN.
+        /// If server selects H2 the proxy will translate; if it selects H1.1 the normal H1 path is used.
+        /// </summary>
+        internal static readonly List<SslApplicationProtocol> Http2AndHttp11Protocols =
+            new() { SslApplicationProtocol.Http2, SslApplicationProtocol.Http11 };
+
 #if NET7_0_OR_GREATER
         internal static readonly List<SslApplicationProtocol> Http3ProtocolAsList =
             new() { SslApplicationProtocol.Http3 };
