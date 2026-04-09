@@ -16,7 +16,7 @@ Report bugs or raise issues here. For programming help use [StackOverflow](http:
 * Supports mutual SSL authentication, proxy authentication & automatic upstream proxy detection
 * Supports kerberos, NTLM authentication over HTTP protocols on windows domain controlled networks
 * SOCKS4/5 Proxy support
-* HTTP/2 support but not tested
+* HTTP/2 support but not tested (Only for .Net 6.0 or above)
 * SOCKS5 with UDP Associate
 
 
