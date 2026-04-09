@@ -10,19 +10,30 @@ namespace Titanium.Web.Proxy.Network.Tcp
     /// </summary>
     internal sealed class UdpRelaySession : IDisposable
     {
+        private IPEndPoint? clientUdpEndPoint;
         private int disposed;
+        private long lastActivityTicks;
 
-        internal UdpRelaySession(IPEndPoint clientUdpEndPoint)
+        internal UdpRelaySession()
         {
-            ClientUdpEndPoint = clientUdpEndPoint;
-            LastActivity = DateTime.UtcNow;
+            Touch();
         }
 
         /// <summary>UDP source endpoint of the SOCKS5 client.</summary>
-        internal IPEndPoint ClientUdpEndPoint { get; }
+        internal IPEndPoint? ClientUdpEndPoint => clientUdpEndPoint;
+
+        internal void SetClientUdpEndPoint(IPEndPoint udpEndPoint)
+        {
+            clientUdpEndPoint = udpEndPoint;
+        }
 
         /// <summary>Last time a datagram was relayed (used for idle cleanup).</summary>
-        internal DateTime LastActivity { get; set; }
+        internal DateTime LastActivityUtc => new DateTime(Interlocked.Read(ref lastActivityTicks), DateTimeKind.Utc);
+
+        internal void Touch()
+        {
+            Interlocked.Exchange(ref lastActivityTicks, DateTime.UtcNow.Ticks);
+        }
 
         public void Dispose()
         {

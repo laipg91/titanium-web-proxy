@@ -188,8 +188,7 @@ namespace Titanium.Web.Proxy
 
             if (isUdpAssociate)
             {
-                await HandleUdpAssociate(endPoint, clientConnection, stream, cancellationTokenSource,
-                    cancellationToken);
+                await HandleUdpAssociate(endPoint, clientConnection, stream, cancellationToken);
                 return;
             }
 
