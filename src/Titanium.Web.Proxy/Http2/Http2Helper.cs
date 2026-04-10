@@ -240,8 +240,7 @@ namespace Titanium.Web.Proxy.Http2
                         {
                             args = sessionFactory();
                             args.IsPromise = true;
-                            if (!sessions.TryAdd(streamId, args))
-                                ;
+                            sessions.TryAdd(streamId, args);
                         }
                         // Register the promised stream ID as well
                         sessions.TryAdd(promisedStreamId, args);
@@ -260,8 +259,7 @@ namespace Titanium.Web.Proxy.Http2
                         if (!sessions.TryGetValue(streamId, out args))
                         {
                             args = sessionFactory();
-                            if (!sessions.TryAdd(streamId, args))
-                                ;
+                            sessions.TryAdd(streamId, args);
                         }
 
                         rr = isClient ? (RequestResponseBase)args.HttpClient.Request : args.HttpClient.Response;
