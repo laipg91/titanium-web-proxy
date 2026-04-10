@@ -63,7 +63,8 @@ namespace Titanium.Web.Proxy
             if (response.Locked)
             {
                 // write custom user response with body and return.
-                await clientStream.WriteResponseAsync(response, cancellationToken);
+                await MirrorHttpStreamWritesAsync(clientStream, args.OnDataReceived,
+                    async () => await clientStream.WriteResponseAsync(response, cancellationToken));
 
                 if (args.HttpClient.HasConnection && !args.HttpClient.CloseServerConnection)
                     // syphon out the original response body from server connection
@@ -93,7 +94,8 @@ namespace Titanium.Web.Proxy
 
             if (!args.IsTransparent && !args.IsSocks) response.Headers.FixProxyHeaders();
 
-            await clientStream.WriteResponseAsync(response, cancellationToken);
+            await MirrorHttpStreamWritesAsync(clientStream, args.OnDataReceived,
+                async () => await clientStream.WriteResponseAsync(response, cancellationToken));
 
             if (response.OriginalHasBody)
             {

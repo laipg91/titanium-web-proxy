@@ -96,6 +96,7 @@ namespace Titanium.Web.Proxy.Http2
             // Pending header block fragments for CONTINUATION frame support (High fix)
             // Key: streamId, Value: accumulated header block fragment bytes
             var pendingHeaderBlocks = new Dictionary<int, MemoryStream>();
+            var ignoredPushStreams = new HashSet<int>();
 
             // Stream-level flow control window sizes (High fix)
             // Key: streamId, Value: current window size (initialized from SETTINGS_INITIAL_WINDOW_SIZE)
@@ -144,6 +145,56 @@ namespace Titanium.Web.Proxy.Http2
 
                 SessionEventArgs? args = null;
                 RequestResponseBase? rr = null;
+
+                if (!isClient && ignoredPushStreams.Contains(streamId))
+                {
+                    if (type == Http2FrameType.Data)
+                    {
+                        localConnConsumed += length;
+                    }
+
+                    if (type == Http2FrameType.RstStream ||
+                        (flags & Http2FrameFlag.EndStream) != 0)
+                    {
+                        ignoredPushStreams.Remove(streamId);
+                        streamWindowSizes.Remove(streamId);
+                    }
+
+                    if (type == Http2FrameType.Data && localConnConsumed >= WindowUpdateThreshold)
+                    {
+                        await WithWriteLockAsync(inputWriteLock,
+                            () => Http2FrameWriter.SendWindowUpdateAsync(input, frameHeaderBuffer, 0,
+                                localConnConsumed, cancellationToken));
+                        localConnConsumed = 0;
+                    }
+
+                    continue;
+                }
+
+                if (!isClient && type == Http2FrameType.PushPromise)
+                {
+                    int offset = 0;
+                    if ((flags & Http2FrameFlag.Padded) != 0)
+                    {
+                        offset++;
+                    }
+
+                    if (length - offset < 4)
+                    {
+                        throw new ProxyHttpException("HTTP/2 PUSH_PROMISE frame is missing the promised stream id.", null, null);
+                    }
+
+                    int promisedStreamId =
+                        ((buffer[offset] & 0x7f) << 24) + (buffer[offset + 1] << 16) +
+                        (buffer[offset + 2] << 8) + buffer[offset + 3];
+
+                    ignoredPushStreams.Add(promisedStreamId);
+
+                    await WithWriteLockAsync(inputWriteLock,
+                        () => Http2FrameWriter.SendRstStreamAsync(input, frameHeaderBuffer, promisedStreamId, 8, cancellationToken));
+
+                    continue;
+                }
 
                 if (type == Http2FrameType.Data || type == Http2FrameType.Headers || type == Http2FrameType.PushPromise)
                 {
@@ -355,9 +406,12 @@ namespace Titanium.Web.Proxy.Http2
                         {
                                 rr.ReadHttp2BeforeHandlerTaskCompletionSource = null;
                                 tcs.SetResult(true);
+                                Action<byte[], int, int> onHeadersForwarded = isClient
+                                    ? args!.OnDataSent
+                                    : args!.OnDataReceived;
                                 await WithWriteLockAsync(outputWriteLock,
                                     () => Http2FrameWriter.SendHeadersAsync(
-                                        outputPeerSettings, encoderState, frameHeader, frameHeaderBuffer, rr, endStream, output, args!.IsPromise, cancellationToken));
+                                        outputPeerSettings, encoderState, frameHeader, frameHeaderBuffer, rr, endStream, output, onHeadersForwarded, cancellationToken));
                             }
                         else
                         {
@@ -455,9 +509,12 @@ namespace Titanium.Web.Proxy.Http2
                             {
                                 rr.ReadHttp2BeforeHandlerTaskCompletionSource = null;
                                 tcs.SetResult(true);
+                                Action<byte[], int, int> onHeadersForwarded = isClient
+                                    ? args.OnDataSent
+                                    : args.OnDataReceived;
                                 await WithWriteLockAsync(outputWriteLock,
                                     () => Http2FrameWriter.SendHeadersAsync(
-                                        outputPeerSettings, encoderState, frameHeader, frameHeaderBuffer, rr, false, output, args.IsPromise, cancellationToken));
+                                        outputPeerSettings, encoderState, frameHeader, frameHeaderBuffer, rr, false, output, onHeadersForwarded, cancellationToken));
                             }
                             else
                             {

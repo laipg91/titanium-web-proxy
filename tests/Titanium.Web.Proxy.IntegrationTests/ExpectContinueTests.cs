@@ -14,6 +14,8 @@ public class ExpectContinueTests
     [TestMethod]
     public async Task ReverseProxy_GotContinueAndOkResponse()
     {
+        int dataSentCount = 0;
+        int dataReceivedCount = 0;
         var testSuite = new TestSuite();
         var server = testSuite.GetServer();
         var continueServer = new HttpContinueServer
@@ -27,6 +29,8 @@ public class ExpectContinueTests
         proxy.BeforeRequest += (sender, e) =>
         {
             e.HttpClient.Request.Url = server.ListeningTcpUrl;
+            e.DataSent += (s, args) => dataSentCount++;
+            e.DataReceived += (s, args) => dataReceivedCount++;
             return Task.CompletedTask;
         };
 
@@ -36,6 +40,8 @@ public class ExpectContinueTests
         Assert.IsNotNull(response, "No response to 'expect: 100-continue' request");
         Assert.AreEqual((int)HttpStatusCode.OK, response.StatusCode);
         Assert.AreEqual(continueServer.ResponseBody, response.BodyString);
+        Assert.IsTrue(dataSentCount > 0, "OnDataSent should have fired");
+        Assert.IsTrue(dataReceivedCount > 0, "OnDataReceived should have fired");
     }
 
     [TestMethod]

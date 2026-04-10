@@ -824,6 +824,7 @@ namespace Titanium.Web.Proxy.Helpers
                         idx += newLineChars;
                     }
 
+                    OnDataWrite(buffer, 0, idx);
                     await BaseStream.WriteAsync(buffer, 0, idx, cancellationToken);
                 }
                 catch
@@ -849,6 +850,7 @@ namespace Titanium.Web.Proxy.Helpers
 
                 try
                 {
+                    OnDataWrite(buffer, 0, idx);
                     await BaseStream.WriteAsync(buffer, 0, idx, cancellationToken);
                 }
                 catch
@@ -904,6 +906,7 @@ namespace Titanium.Web.Proxy.Helpers
 
             try
             {
+                OnDataWrite(data, 0, data.Length);
                 await BaseStream.WriteAsync(data, 0, data.Length, cancellationToken);
                 if (flush) await BaseStream.FlushAsync(cancellationToken);
             }
@@ -922,6 +925,7 @@ namespace Titanium.Web.Proxy.Helpers
 
             try
             {
+                OnDataWrite(data, offset, count);
                 await BaseStream.WriteAsync(data, offset, count, cancellationToken);
                 if (flush) await BaseStream.FlushAsync(cancellationToken);
             }

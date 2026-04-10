@@ -10,6 +10,8 @@ using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Server.Kestrel.Core;
 using Microsoft.VisualStudio.TestTools.UnitTesting;
 using Titanium.Web.Proxy.IntegrationTests.Setup;
+using Titanium.Web.Proxy.IntegrationTests.Helpers;
+using Titanium.Web.Proxy.Models;
 
 namespace Titanium.Web.Proxy.IntegrationTests;
 
@@ -196,5 +198,163 @@ public class Http2Tests
         Assert.AreEqual(HttpStatusCode.OK, response.StatusCode);
         var responseBody = await response.Content.ReadAsStringAsync();
         Assert.AreEqual("Response-Chunked-H2-H1-TestChunkedData", responseBody);
+    }
+    
+    [TestMethod]
+    public async Task Can_Relay_H2_To_External_NgHttp2()
+    {
+        // No local server needed for this external test
+        using var testSuite = new TestSuite();
+        var proxy = testSuite.GetProxy(null, true);
+        
+        int dataSentCount = 0;
+        int dataReceivedCount = 0;
+
+        var explicitEndPoint = (ExplicitProxyEndPoint)proxy.ProxyEndPoints[0];
+        explicitEndPoint.BeforeTunnelConnectRequest += (sender, e) =>
+        {
+            if (e.HttpClient.Request.RequestUri.Host.Contains("nghttp2.org"))
+            {
+                e.DecryptSsl = true;
+            }
+            return Task.CompletedTask;
+        };
+
+        proxy.BeforeRequest += (sender, e) =>
+        {
+            if (e.HttpClient.Request.RequestUri.Host.Contains("nghttp2.org"))
+            {
+                e.DataSent += (s, args) => dataSentCount++;
+                e.DataReceived += (s, args) => dataReceivedCount++;
+            }
+            return Task.CompletedTask;
+        };
+
+        // Custom client with certificate validation bypass for proxy fake certs
+        var handler = new HttpClientHandler
+        {
+            Proxy = new WebProxy($"http://localhost:{proxy.ProxyEndPoints[0].Port}"),
+            UseProxy = true,
+            ServerCertificateCustomValidationCallback = (m, c, ch, er) => true
+        };
+
+        using var client = new HttpClient(handler);
+        var request = new HttpRequestMessage(HttpMethod.Get, "https://nghttp2.org/")
+        {
+            Version = HttpVersion.Version20,
+            VersionPolicy = HttpVersionPolicy.RequestVersionExact
+        };
+
+        var response = await client.SendAsync(request);
+
+        Assert.AreEqual(HttpStatusCode.OK, response.StatusCode);
+        
+        // Data events should have fired if it was a real H2 relay inside the decrypted session
+        Assert.IsTrue(dataSentCount > 0, "OnDataSent should have fired");
+        Assert.IsTrue(dataReceivedCount > 0, "OnDataReceived should have fired");
+    }
+
+    [TestMethod]
+    public async Task Can_Translate_H2_Client_To_External_Http1()
+    {
+        using var testSuite = new TestSuite();
+        var proxy = testSuite.GetProxy(null, true);
+
+        int dataSentCount = 0;
+        int dataReceivedCount = 0;
+        proxy.BeforeRequest += (sender, e) =>
+        {
+            if (e.HttpClient.Request.RequestUri.Host.Contains("neverssl.com"))
+            {
+                e.DataSent += (s, args) => dataSentCount++;
+                e.DataReceived += (s, args) => dataReceivedCount++;
+            }
+            return Task.CompletedTask;
+        };
+
+        // Client forces HTTP/2
+        var handler = new HttpClientHandler
+        {
+            Proxy = new WebProxy($"http://localhost:{proxy.ProxyEndPoints[0].Port}"),
+            UseProxy = true,
+            ServerCertificateCustomValidationCallback = (m, c, ch, er) => true
+        };
+
+        using var client = new HttpClient(handler);
+        client.DefaultRequestHeaders.Add("User-Agent", "Mozilla/5.0");
+        var request = new HttpRequestMessage(HttpMethod.Get, "http://neverssl.com/")
+        {
+            Version = HttpVersion.Version20,
+            // neverssl.com is HTTP-1.1 accessible, so the proxy will contact it via HTTP/1.1
+            // Even if the request from HttpClient is downgraded by .NET or sent as H1 over proxy, 
+            // we test it to ensure no exceptions are thrown and translation / relay works.
+        };
+
+        var response = await client.SendAsync(request);
+
+        if (response.StatusCode != HttpStatusCode.OK)
+        {
+            var err = await response.Content.ReadAsStringAsync();
+            Assert.Fail($"Status: {response.StatusCode}, Body: {err}");
+        }
+
+        Assert.AreEqual(HttpStatusCode.OK, response.StatusCode);
+        var responseBody = await response.Content.ReadAsStringAsync();
+        Assert.IsTrue(responseBody.Contains("neverssl", StringComparison.OrdinalIgnoreCase), "Response should contain neverssl content");
+        Assert.IsTrue(dataSentCount > 0, "OnDataSent should have fired");
+        Assert.IsTrue(dataReceivedCount > 0, "OnDataReceived should have fired");
+    }
+
+    [TestMethod]
+    public async Task Can_Translate_H1_Client_To_External_Http2()
+    {
+        using var testSuite = new TestSuite();
+        var proxy = testSuite.GetProxy(null, true);
+
+        int dataSentCount = 0;
+        int dataReceivedCount = 0;
+        proxy.BeforeRequest += (sender, e) =>
+        {
+            if (e.HttpClient.Request.RequestUri.Host.Contains("nghttp2.org"))
+            {
+                e.DataSent += (s, args) => dataSentCount++;
+                e.DataReceived += (s, args) => dataReceivedCount++;
+            }
+            return Task.CompletedTask;
+        };
+
+        var explicitEndPoint = (ExplicitProxyEndPoint)proxy.ProxyEndPoints[0];
+        explicitEndPoint.BeforeTunnelConnectRequest += (sender, e) =>
+        {
+            if (e.HttpClient.Request.RequestUri.Host.Contains("nghttp2.org"))
+            {
+                e.DecryptSsl = true;
+            }
+            return Task.CompletedTask;
+        };
+
+        // Client forces HTTP/1.1
+        var handler = new HttpClientHandler
+        {
+            Proxy = new WebProxy($"http://localhost:{proxy.ProxyEndPoints[0].Port}"),
+            UseProxy = true,
+            ServerCertificateCustomValidationCallback = (m, c, ch, er) => true
+        };
+
+        using var client = new HttpClient(handler);
+        var request = new HttpRequestMessage(HttpMethod.Get, "https://nghttp2.org/")
+        {
+            Version = HttpVersion.Version11,
+            VersionPolicy = HttpVersionPolicy.RequestVersionExact
+        };
+
+        var response = await client.SendAsync(request);
+
+        Assert.AreEqual(HttpStatusCode.OK, response.StatusCode);
+        var responseBody = await response.Content.ReadAsStringAsync();
+        // nghttp2.org homepage likely contains something we can assert
+        Assert.IsTrue(responseBody.Contains("nghttp2", StringComparison.OrdinalIgnoreCase), "Response should contain nghttp2 content");
+        Assert.IsTrue(dataSentCount > 0, "OnDataSent should have fired");
+        Assert.IsTrue(dataReceivedCount > 0, "OnDataReceived should have fired");
     }
 }

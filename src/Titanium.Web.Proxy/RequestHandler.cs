@@ -18,6 +18,7 @@ using Titanium.Web.Proxy.Models;
 using Titanium.Web.Proxy.Network;
 using Titanium.Web.Proxy.Network.Tcp;
 using Titanium.Web.Proxy.Shared;
+using Titanium.Web.Proxy.StreamExtended.Network;
 
 namespace Titanium.Web.Proxy
 {
@@ -99,14 +100,15 @@ namespace Titanium.Web.Proxy
                             if (!args.IsTransparent && !args.IsSocks)
                             {
                                 // proxy authorization check
-                                if (connectRequest == null && await CheckAuthorization(args) == false)
-                                {
-                                    await OnBeforeResponse(args);
+                            if (connectRequest == null && await CheckAuthorization(args) == false)
+                            {
+                                await OnBeforeResponse(args);
 
-                                    // send the response
-                                    await clientStream.WriteResponseAsync(args.HttpClient.Response, cancellationToken);
-                                    return;
-                                }
+                                // send the response
+                                await MirrorHttpStreamWritesAsync(clientStream, args.OnDataReceived,
+                                    async () => await clientStream.WriteResponseAsync(args.HttpClient.Response, cancellationToken));
+                                return;
+                            }
 
                                 PrepareRequestHeaders(request.Headers);
                                 request.Host = request.RequestUri.Authority;
@@ -345,8 +347,9 @@ namespace Titanium.Web.Proxy
 
             var body = request.CompressBodyAndUpdateContentLength();
 
-            await args.HttpClient.SendRequest(Enable100ContinueBehaviour, args.IsTransparent,
-                cancellationToken);
+            await MirrorHttpStreamWritesAsync(args.HttpClient.Connection.Stream, args.OnDataSent,
+                async () => await args.HttpClient.SendRequest(Enable100ContinueBehaviour, args.IsTransparent,
+                    cancellationToken));
 
             // If a successful 100 continue request was made, inform that to the client and reset response
             if (request.ExpectationSucceeded)
@@ -357,7 +360,8 @@ namespace Titanium.Web.Proxy
                 var headerBuilder = new HeaderBuilder();
                 headerBuilder.WriteResponseLine(response.HttpVersion, response.StatusCode, response.StatusDescription);
                 headerBuilder.WriteHeaders(response.Headers);
-                await writer.WriteHeadersAsync(headerBuilder, cancellationToken);
+                await MirrorHttpStreamWritesAsync(writer, args.OnDataReceived,
+                    async () => await writer.WriteHeadersAsync(headerBuilder, cancellationToken));
 
                 await args.ClearResponse(cancellationToken);
             }
@@ -366,7 +370,8 @@ namespace Titanium.Web.Proxy
             if (request.HasBody)
             {
                 if (request.IsBodyRead)
-                    await args.HttpClient.Connection.Stream.WriteBodyAsync(body!, request.IsChunked, cancellationToken);
+                    await MirrorHttpStreamWritesAsync(args.HttpClient.Connection.Stream, args.OnDataSent,
+                        async () => await args.HttpClient.Connection.Stream.WriteBodyAsync(body!, request.IsChunked, cancellationToken));
                 else if (!request.ExpectationFailed)
                     // get the request body unless an unsuccessful 100 continue request was made
                     await args.CopyRequestBodyAsync(args.HttpClient.Connection.Stream, TransformationMode.None,
@@ -415,6 +420,23 @@ namespace Titanium.Web.Proxy
             args.TimeLine["Request Received"] = DateTime.UtcNow;
 
             if (BeforeRequest != null) await BeforeRequest.InvokeAsync(this, args, ExceptionFunc);
+        }
+
+        private static async Task MirrorHttpStreamWritesAsync(HttpStream stream,
+            Action<byte[], int, int> onDataWritten, Func<Task> writeAction)
+        {
+            EventHandler<DataEventArgs>? handler = (sender, eventArgs) =>
+                onDataWritten(eventArgs.Buffer, eventArgs.Offset, eventArgs.Count);
+
+            stream.DataWrite += handler;
+            try
+            {
+                await writeAction();
+            }
+            finally
+            {
+                stream.DataWrite -= handler;
+            }
         }
 
         /// <summary>

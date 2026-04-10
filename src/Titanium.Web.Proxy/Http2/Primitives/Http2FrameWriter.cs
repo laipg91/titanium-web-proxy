@@ -156,7 +156,7 @@ namespace Titanium.Web.Proxy.Http2.Primitives
             RequestResponseBase rr,
             bool endStream,
             Stream destination,
-            bool pushPromise,
+            Action<byte[], int, int>? onWritten,
             CancellationToken cancellationToken)
         {
             // Maintain stateful encoder (only recreate when HeaderTableSize decreases).
@@ -211,12 +211,20 @@ namespace Titanium.Web.Proxy.Http2.Primitives
             if (rr.Priority.HasValue) flags |= Http2FrameFlag.Priority;
 
             frameHeader.Length = encoded.Length;
-            frameHeader.Type   = pushPromise ? Http2FrameType.PushPromise : Http2FrameType.Headers;
+            frameHeader.Type   = Http2FrameType.Headers;
             frameHeader.Flags  = flags;
 
             frameHeader.CopyToBuffer(headerBuffer);
             await destination.WriteAsync(headerBuffer, 0, 9,              cancellationToken);
             await destination.WriteAsync(encoded,      0, encoded.Length, cancellationToken);
+
+            if (onWritten != null)
+            {
+                var frameBytes = new byte[9 + encoded.Length];
+                Buffer.BlockCopy(headerBuffer, 0, frameBytes, 0, 9);
+                Buffer.BlockCopy(encoded, 0, frameBytes, 9, encoded.Length);
+                onWritten(frameBytes, 0, frameBytes.Length);
+            }
         }
 
         // ── DATA ──────────────────────────────────────────────────────────────
@@ -238,7 +246,7 @@ namespace Titanium.Web.Proxy.Http2.Primitives
         {
             var body = rr.CompressBodyAndUpdateContentLength();
             await SendHeadersAsync(remoteSettings, encoderState, frameHeader, headerBuffer,
-                rr, !(rr.HasBody && rr.IsBodyRead), destination, false, cancellationToken);
+                rr, !(rr.HasBody && rr.IsBodyRead), destination, null, cancellationToken);
 
             if (!rr.HasBody || !rr.IsBodyRead || body == null) return;
 
