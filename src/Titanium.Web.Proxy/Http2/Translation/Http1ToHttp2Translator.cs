@@ -127,7 +127,7 @@ namespace Titanium.Web.Proxy.Http2.Translation
                 if (request.HasBody)
                     await ForwardBodyAsDataFramesAsync(
                         clientStream, serverStream,
-                        frameHeader, frameHeaderBuf, dataBuffer, request, streamId, ct);
+                        frameHeader, frameHeaderBuf, dataBuffer, args, streamId, ct);
 
                 // ── Read H2 response from server ─────────────────────────────
                 var response = args.HttpClient.Response;
@@ -135,7 +135,7 @@ namespace Titanium.Web.Proxy.Http2.Translation
                 await ReadH2ResponseAsync(
                     serverStream, serverSettings, encoderState,
                     frameHeader, frameHeaderBuf, dataBuffer,
-                    response, streamId, ct, exceptionFunc);
+                    args, streamId, ct, exceptionFunc);
 
                 // Fire before-response hook
                 await onBeforeResponse(args);
@@ -239,12 +239,13 @@ namespace Titanium.Web.Proxy.Http2.Translation
         private static async Task ForwardBodyAsDataFramesAsync(
             HttpClientStream clientStream, Stream serverStream,
             Http2FrameHeader frameHeader, byte[] headerBuffer, byte[] dataBuffer,
-            Request request, int streamId, CancellationToken ct)
+            SessionEventArgs args, int streamId, CancellationToken ct)
         {
+            var request = args.HttpClient.Request;
             if (request.IsChunked)
             {
                 await ForwardChunkedBodyAsDataFramesAsync(
-                    clientStream, serverStream, frameHeader, headerBuffer, dataBuffer, streamId, ct);
+                    clientStream, serverStream, frameHeader, headerBuffer, dataBuffer, args, streamId, ct);
                 return;
             }
 
@@ -257,6 +258,7 @@ namespace Titanium.Web.Proxy.Http2.Translation
                     throw new IOException("Unexpected end of HTTP/1.x request body.");
 
                 remaining -= read;
+                args.OnDataSent(dataBuffer, 0, read);
                 await SendDataFrameAsync(
                     serverStream, frameHeader, headerBuffer, dataBuffer, read, streamId, remaining == 0, ct);
             }
@@ -265,7 +267,7 @@ namespace Titanium.Web.Proxy.Http2.Translation
         private static async Task ForwardChunkedBodyAsDataFramesAsync(
             HttpClientStream clientStream, Stream serverStream,
             Http2FrameHeader frameHeader, byte[] headerBuffer, byte[] dataBuffer,
-            int streamId, CancellationToken ct)
+            SessionEventArgs args, int streamId, CancellationToken ct)
         {
             while (true)
             {
@@ -283,6 +285,7 @@ namespace Titanium.Web.Proxy.Http2.Translation
                 if (chunkSize == 0)
                 {
                     await ConsumeChunkTrailersAsync(clientStream, ct);
+                    args.OnDataSent(dataBuffer, 0, 0);
                     await SendDataFrameAsync(
                         serverStream, frameHeader, headerBuffer, dataBuffer, 0, streamId, true, ct);
                     return;
@@ -297,6 +300,7 @@ namespace Titanium.Web.Proxy.Http2.Translation
                         throw new IOException("Unexpected end of chunked request data.");
 
                     remaining -= read;
+                    args.OnDataSent(dataBuffer, 0, read);
                     await SendDataFrameAsync(
                         serverStream, frameHeader, headerBuffer, dataBuffer, read, streamId, false, ct);
                 }
@@ -340,9 +344,10 @@ namespace Titanium.Web.Proxy.Http2.Translation
         private static async Task ReadH2ResponseAsync(
             Stream serverStream, Http2Settings serverSettings, Http2EncoderState encoderState,
             Http2FrameHeader frameHeader, byte[] headerBuffer, byte[] dataBuffer,
-            Response response, int expectedStreamId,
+            SessionEventArgs args, int expectedStreamId,
             CancellationToken ct, ExceptionHandler? exceptionFunc)
         {
+            var         response   = args.HttpClient.Response;
             var         bodyAccum  = new MemoryStream();
             Decoder?    decoder    = null;
             int         tableSize  = 0;
@@ -417,6 +422,7 @@ namespace Titanium.Web.Proxy.Http2.Translation
                 }
                 else if (type == Http2FrameType.Data)
                 {
+                    args.OnDataReceived(dataBuffer, 0, length);
                     bodyAccum.Write(dataBuffer, 0, length);
                     if ((flags & Http2FrameFlag.EndStream) != 0) break;
                 }

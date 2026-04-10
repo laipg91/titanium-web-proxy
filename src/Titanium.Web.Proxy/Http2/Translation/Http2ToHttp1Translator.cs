@@ -216,6 +216,7 @@ namespace Titanium.Web.Proxy.Http2.Translation
                         }
 
                         streamContext.RequestBody ??= new MemoryStream();
+                        streamContext.Args.OnDataSent(dataBuffer, offset, dataLength);
                         streamContext.RequestBody.Write(dataBuffer, offset, dataLength);
 
                         if (endStream)
@@ -312,7 +313,7 @@ namespace Titanium.Web.Proxy.Http2.Translation
                         await SendH1RequestAsync(serverStream, request, context.RequestBody, ct);
 
                         response.RequestMethod = request.Method;
-                        await ReadH1ResponseAsync(serverStream, response, ct);
+                        await ReadH1ResponseAsync(serverStream, context.Args, ct);
 
                         await onBeforeResponse(context.Args);
 
@@ -384,8 +385,9 @@ namespace Titanium.Web.Proxy.Http2.Translation
         /// <summary>
         /// Reads an HTTP/1.x response from the server and populates the <see cref="Response"/> object.
         /// </summary>
-        private static async Task ReadH1ResponseAsync(Stream server, Response response, CancellationToken ct)
+        private static async Task ReadH1ResponseAsync(Stream server, SessionEventArgs args, CancellationToken ct)
         {
+            var response = args.HttpClient.Response;
             string? statusLine = await ReadLineFromStreamAsync(server, ct);
             if (string.IsNullOrEmpty(statusLine))
                 return;
@@ -420,15 +422,15 @@ namespace Titanium.Web.Proxy.Http2.Translation
             byte[] bodyBytes;
             if (response.IsChunked)
             {
-                bodyBytes = await ReadChunkedBodyAsync(server, ct);
+                bodyBytes = await ReadChunkedBodyAsync(server, args, ct);
             }
             else if (response.ContentLength >= 0)
             {
-                bodyBytes = await ReadFixedLengthBodyAsync(server, response.ContentLength, ct);
+                bodyBytes = await ReadFixedLengthBodyAsync(server, args, response.ContentLength, ct);
             }
             else if (!response.KeepAlive || response.HttpVersion == HttpHeader.Version10)
             {
-                bodyBytes = await ReadUntilEofAsync(server, ct);
+                bodyBytes = await ReadUntilEofAsync(server, args, ct);
             }
             else
             {
@@ -439,7 +441,7 @@ namespace Titanium.Web.Proxy.Http2.Translation
             response.IsBodyRead = true;
         }
 
-        private static async Task<byte[]> ReadFixedLengthBodyAsync(Stream stream, long contentLength, CancellationToken ct)
+        private static async Task<byte[]> ReadFixedLengthBodyAsync(Stream stream, SessionEventArgs args, long contentLength, CancellationToken ct)
         {
             if (contentLength <= 0)
                 return Array.Empty<byte>();
@@ -452,13 +454,14 @@ namespace Titanium.Web.Proxy.Http2.Translation
                 if (read == 0)
                     throw new IOException("Unexpected end of HTTP/1.x response body.");
 
+                args.OnDataReceived(body, totalRead, read);
                 totalRead += read;
             }
 
             return body;
         }
 
-        private static async Task<byte[]> ReadChunkedBodyAsync(Stream stream, CancellationToken ct)
+        private static async Task<byte[]> ReadChunkedBodyAsync(Stream stream, SessionEventArgs args, CancellationToken ct)
         {
             using var body = new MemoryStream();
 
@@ -481,7 +484,7 @@ namespace Titanium.Web.Proxy.Http2.Translation
                     break;
                 }
 
-                var chunk = await ReadFixedLengthBodyAsync(stream, chunkSize, ct);
+                var chunk = await ReadFixedLengthBodyAsync(stream, args, chunkSize, ct);
                 await body.WriteAsync(chunk, 0, chunk.Length, ct);
 
                 var chunkTerminator = await ReadLineFromStreamAsync(stream, ct);
@@ -492,7 +495,7 @@ namespace Titanium.Web.Proxy.Http2.Translation
             return body.ToArray();
         }
 
-        private static async Task<byte[]> ReadUntilEofAsync(Stream stream, CancellationToken ct)
+        private static async Task<byte[]> ReadUntilEofAsync(Stream stream, SessionEventArgs args, CancellationToken ct)
         {
             using var body = new MemoryStream();
             var buffer = new byte[8192];
@@ -503,6 +506,7 @@ namespace Titanium.Web.Proxy.Http2.Translation
                 if (read == 0)
                     break;
 
+                args.OnDataReceived(buffer, 0, read);
                 await body.WriteAsync(buffer, 0, read, ct);
             }
 
