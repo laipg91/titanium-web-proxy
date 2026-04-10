@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Linq;
 using System.Net;
 using System.Security.Cryptography.X509Certificates;
@@ -24,7 +24,7 @@ public class TestServer : IDisposable
     private Func<HttpContext, Task> requestHandler;
     private Func<ConnectionContext, Task> tcpRequestHandler;
 
-    public TestServer(X509Certificate2 serverCertificate, bool requireMutualTls)
+    public TestServer(X509Certificate2 serverCertificate, bool requireMutualTls, Microsoft.AspNetCore.Server.Kestrel.Core.HttpProtocols? protocols = null)
     {
         host = Host.CreateDefaultBuilder()
             .ConfigureLogging(logging =>
@@ -53,6 +53,10 @@ public class TestServer : IDisposable
 
                     options.Listen(IPAddress.Loopback, 0, listenOptions =>
                     {
+                        if (protocols.HasValue)
+                        {
+                            listenOptions.Protocols = protocols.Value;
+                        }
                         listenOptions.UseHttps(serverCertificate);
                     });
                     options.Listen(IPAddress.Loopback, 0, listenOptions =>

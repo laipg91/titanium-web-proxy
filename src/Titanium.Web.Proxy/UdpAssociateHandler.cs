@@ -21,9 +21,14 @@ namespace Titanium.Web.Proxy
         private int udpAssociateSessionCount;
 
         /// <summary>
-        ///     Entry point called from SocksClientHandler when CMD=0x03 is received.
-        ///     SOCKS5 auth has already been completed when this is called.
+        /// Handles the SOCKS5 UDP ASSOCIATE command.
+        /// Entry point called from SocksClientHandler when CMD=0x03 is received.
+        /// SOCKS5 auth has already been completed when this is called.
         /// </summary>
+        /// <param name="endPoint">The proxy endpoint.</param>
+        /// <param name="clientConnection">The client connection.</param>
+        /// <param name="tcpStream">The client TCP stream.</param>
+        /// <param name="cancellationToken">The cancellation token.</param>
         private async Task HandleUdpAssociate(
             SocksProxyEndPoint endPoint,
             TcpClientConnection clientConnection,
@@ -121,6 +126,9 @@ namespace Titanium.Web.Proxy
             }
         }
 
+        /// <summary>
+        /// Resolves the IP address to bind both the relay and remote sockets to.
+        /// </summary>
         private static IPAddress ResolveUdpBindAddress(
             SocksProxyEndPoint endPoint,
             TcpClientConnection clientConnection)
@@ -138,6 +146,9 @@ namespace Titanium.Web.Proxy
                 : IPAddress.Loopback;
         }
 
+        /// <summary>
+        /// Runs both relay loops (Client-to-Remote and Remote-to-Client).
+        /// </summary>
         private static async Task RunRelayLoops(
             Socket relaySocket,
             Socket remoteSocket,
@@ -174,8 +185,8 @@ namespace Titanium.Web.Proxy
         }
 
         /// <summary>
-        ///     Loop A: client -> relay -> remote.
-        ///     SOCKS5 UDP header is stripped via offset.
+        /// Loop A: client -> relay -> remote.
+        /// SOCKS5 UDP header is stripped via offset.
         /// </summary>
         private static async Task LoopClientToRemote(
             Socket relaySocket,
@@ -212,8 +223,9 @@ namespace Titanium.Web.Proxy
                     {
                         IPAddress? resolved = null;
                         var now = DateTime.UtcNow;
+                        var dnsCacheKey = GetDnsCacheKey(domainName, remoteSocket.AddressFamily);
 
-                        if (dnsCache.TryGetValue(domainName, out var cached) &&
+                        if (dnsCache.TryGetValue(dnsCacheKey, out var cached) &&
                             now.Ticks < cached.ExpiryTicks)
                         {
                             resolved = cached.Address;
@@ -225,8 +237,10 @@ namespace Titanium.Web.Proxy
                                 var addrs = await System.Net.Dns.GetHostAddressesAsync(domainName);
                                 if (addrs == null || addrs.Length == 0) continue;
 
-                                resolved = addrs[0];
-                                dnsCache[domainName] = new DnsCacheEntry(
+                                resolved = SelectBestResolvedAddress(addrs, remoteSocket.AddressFamily);
+                                if (resolved == null) continue;
+
+                                dnsCache[dnsCacheKey] = new DnsCacheEntry(
                                     resolved,
                                     DateTime.UtcNow.Ticks + dnsCacheTtlTicks);
                             }
@@ -266,9 +280,25 @@ namespace Titanium.Web.Proxy
             }
         }
 
+        private static string GetDnsCacheKey(string domainName, AddressFamily addressFamily)
+        {
+            return domainName + "|" + (int)addressFamily;
+        }
+
+        private static IPAddress? SelectBestResolvedAddress(IPAddress[] addresses, AddressFamily addressFamily)
+        {
+            foreach (var address in addresses)
+            {
+                if (address.AddressFamily == addressFamily)
+                    return address;
+            }
+
+            return addresses.Length > 0 ? addresses[0] : null;
+        }
+
         /// <summary>
-        ///     Loop B: remote -> remote socket -> client.
-        ///     Payload is received after a reserved header prefix, then the SOCKS5 header is written in-place.
+        /// Loop B: remote -> remote socket -> client.
+        /// Payload is received after a reserved header prefix, then the SOCKS5 header is written in-place.
         /// </summary>
         private static async Task LoopRemoteToClient(
             Socket remoteSocket,
@@ -323,6 +353,9 @@ namespace Titanium.Web.Proxy
             }
         }
 
+        /// <summary>
+        /// Monitors the SOCKS TCP connection. If it closes, the UDP relay session is terminated.
+        /// </summary>
         private static async Task MonitorUdpTcpLifetime(
             System.IO.Stream tcpStream,
             CancellationTokenSource relayCts)
@@ -346,6 +379,9 @@ namespace Titanium.Web.Proxy
             }
         }
 
+        /// <summary>
+        /// Watches for inactivity on the UDP relay. If no activity occurs within the timeout, the session is terminated.
+        /// </summary>
         private static async Task WatchIdleTimeout(
             TimeSpan timeout,
             UdpRelaySession relaySession,
@@ -374,15 +410,18 @@ namespace Titanium.Web.Proxy
             }
         }
 
+        /// <summary>
+        /// Sends the SOCKS5 reply to the client after a successful UDP ASSOCIATE bind.
+        /// </summary>
         private static async Task SendSocks5UdpAssociateReply(
             System.IO.Stream stream, IPAddress bindAddress, int port, CancellationToken ct)
         {
             var addrBytes = bindAddress.GetAddressBytes();
             var replyLen = 4 + addrBytes.Length + 2;
             var reply = new byte[replyLen];
-            reply[0] = 5;
-            reply[1] = 0;
-            reply[2] = 0;
+            reply[0] = 5; // VER
+            reply[1] = 0; // REP = success
+            reply[2] = 0; // RSV
             reply[3] = bindAddress.AddressFamily == AddressFamily.InterNetworkV6 ? (byte)4 : (byte)1;
             addrBytes.CopyTo(reply, 4);
             reply[4 + addrBytes.Length] = (byte)(port >> 8);

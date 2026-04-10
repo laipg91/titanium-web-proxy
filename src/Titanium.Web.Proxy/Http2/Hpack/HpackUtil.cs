@@ -1,4 +1,4 @@
-﻿/*
+/*
  * Copyright 2014 Twitter, Inc
  * This file is a derivative work modified by Ringo Leese
  *
@@ -18,16 +18,35 @@
 namespace Titanium.Web.Proxy.Http2.Hpack
 {
 
+    /// <summary>
+    /// HPACK utility constants and types (RFC 7541).
+    /// </summary>
     public static class HpackUtil
     {
-        // Section 6.2. Literal Header Field Representation
+        /// <summary>
+        /// HPACK indexing types as defined in RFC 7541 Section 6.2.
+        /// </summary>
         public enum IndexType
         {
-            Incremental, // Section 6.2.1. Literal Header Field with Incremental Indexing
-            None, // Section 6.2.2. Literal Header Field without Indexing
-            Never // Section 6.2.3. Literal Header Field never Indexed
+            /// <summary>
+            /// 6.2.1. Literal Header Field with Incremental Indexing
+            /// </summary>
+            Incremental,
+
+            /// <summary>
+            /// 6.2.2. Literal Header Field without Indexing
+            /// </summary>
+            None,
+
+            /// <summary>
+            /// 6.2.3. Literal Header Field never Indexed
+            /// </summary>
+            Never
         }
 
+        /// <summary>
+        /// The Huffman EOS (End Of String) symbol.
+        /// </summary>
         public const int HuffmanEos = 256;
 
         // Appendix B: Huffman Codes

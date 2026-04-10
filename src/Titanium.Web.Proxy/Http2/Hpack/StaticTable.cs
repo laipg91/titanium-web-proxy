@@ -1,4 +1,4 @@
-﻿/*
+/*
  * Copyright 2014 Twitter, Inc
  * This file is a derivative work modified by Ringo Leese
  *
@@ -21,24 +21,42 @@ using Titanium.Web.Proxy.Models;
 namespace Titanium.Web.Proxy.Http2.Hpack
 {
 
+    /// <summary>
+    /// HPACK static table as defined in RFC 7541 Appendix A.
+    /// </summary>
     internal static class StaticTable
     {
         /// <summary>
-        ///     Appendix A: Static Table Definition
+        /// Appendix A: Static Table Definition
         /// </summary>
         /// <see cref="http://tools.ietf.org/html/rfc7541#appendix-A" />
         private static readonly List<HttpHeader> staticTable;
 
         private static readonly Dictionary<ByteString, int> staticIndexByName;
 
+        /// <summary>
+        /// :authority
+        /// </summary>
         public static ByteString KnownHeaderAuhtority = (ByteString)":authority";
 
+        /// <summary>
+        /// :method
+        /// </summary>
         public static ByteString KnownHeaderMethod = (ByteString)":method";
 
+        /// <summary>
+        /// :path
+        /// </summary>
         public static ByteString KnownHeaderPath = (ByteString)":path";
 
+        /// <summary>
+        /// :scheme
+        /// </summary>
         public static ByteString KnownHeaderScheme = (ByteString)":scheme";
 
+        /// <summary>
+        /// :status
+        /// </summary>
         public static ByteString KnownHeaderStatus = (ByteString)":status";
 
         static StaticTable()

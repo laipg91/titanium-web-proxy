@@ -70,7 +70,7 @@ namespace Titanium.Web.Proxy.Network.Tcp
             cacheKeyBuilder.Append(isHttps);
 
             if (applicationProtocols != null)
-                foreach (var protocol in applicationProtocols.OrderBy(x => x))
+                foreach (var protocol in applicationProtocols.OrderBy(x => x.ToString(), StringComparer.Ordinal))
                 {
                     cacheKeyBuilder.Append("-");
                     cacheKeyBuilder.Append(protocol);

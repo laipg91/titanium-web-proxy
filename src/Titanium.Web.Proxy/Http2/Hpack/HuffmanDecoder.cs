@@ -1,4 +1,4 @@
-﻿/*
+/*
  * Copyright 2014 Twitter, Inc
  * This file is a derivative work modified by Ringo Leese
  *
@@ -21,6 +21,9 @@ using System.IO;
 namespace Titanium.Web.Proxy.Http2.Hpack
 {
 
+    /// <summary>
+    /// HPACK Huffman decoder as defined in RFC 7541 Section 5.2.
+    /// </summary>
     public class HuffmanDecoder
     {
         /// <summary>

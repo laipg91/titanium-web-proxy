@@ -18,25 +18,19 @@ using Decoder = Titanium.Web.Proxy.Http2.Hpack.Decoder;
 namespace Titanium.Web.Proxy.Http2.Translation
 {
     /// <summary>
-    /// Scenario B: HTTP/2 client ↔ HTTP/1.x server.
-    ///
-    /// Strategy: <b>serialize</b> (Q3 decision).
-    /// H2 streams are queued and dispatched one-at-a-time to the H1 server.
-    /// This avoids head-of-line issues at the cost of not exploiting H2 multiplexing
-    /// on the server side — acceptable because Scenario B is an edge case.
-    ///
-    /// Architecture:
-    ///   ReadLoop  — reads H2 frames from client, enqueues completed requests.
-    ///   WriteLoop — dequeues requests, sends H1 to server, converts response back to H2.
-    ///
-    /// Both loops run concurrently; the queue decouples them.
+    /// Scenario B: HTTP/2 client to HTTP/1.x server.
+    /// Requests are serialized onto the HTTP/1.x connection while the client side
+    /// still speaks HTTP/2 to the proxy.
     /// </summary>
     internal sealed class Http2ToHttp1Translator : IHttp2Translator
     {
+        /// <summary>
+        /// Runs the translation loop for an HTTP/2 client and an HTTP/1.x server.
+        /// </summary>
         public async Task TranslateAsync(
             HttpClientStream clientStream,
             Stream serverStream,
-            SessionEventArgs? initialSession,   // not used in Scenario B — H2 client sends preface directly
+            SessionEventArgs? initialSession,
             Func<SessionEventArgs> sessionFactory,
             Func<SessionEventArgs, Task> onBeforeRequest,
             Func<SessionEventArgs, Task> onBeforeResponse,
@@ -44,36 +38,37 @@ namespace Titanium.Web.Proxy.Http2.Translation
             Guid connectionId,
             ExceptionHandler? exceptionFunc)
         {
-            // Unbounded channel: ReadLoop produces, WriteLoop consumes.
+            _ = initialSession;
+            _ = connectionId;
+
             var queue = Channel.CreateUnbounded<Http2StreamContext>(
                 new UnboundedChannelOptions { SingleReader = true, SingleWriter = true });
 
-            // Channel used by ReadLoop to notify WriteLoop that a SETTINGS ACK must be sent.
-            // We keep writes on clientStream serialized in WriteLoop to avoid concurrent writes.
-            var settingsAckChannel = Channel.CreateUnbounded<bool>(
-                new UnboundedChannelOptions { SingleReader = true, SingleWriter = true });
-
-            var ct             = cts.Token;
             var clientSettings = new Http2Settings();
-            var frameHeaderBuf = new byte[9];
-            var frameHeader    = new Http2FrameHeader();
+            var clientWriteLock = new SemaphoreSlim(1, 1);
+            var serverFrameHeaderBuffer = new byte[9];
 
-            var readTask  = ReadLoopAsync(clientStream, clientSettings, frameHeader, frameHeaderBuf,
-                                          sessionFactory, onBeforeRequest, queue.Writer, settingsAckChannel.Writer,
-                                          cts, exceptionFunc);
+            // Send the server connection preface first.
+            // ACKs and stream frames must not overtake this SETTINGS frame.
+            await Http2FrameWriter.SendSettingsAsync(clientStream, serverFrameHeaderBuffer, cts.Token);
 
-            var writeTask = WriteLoopAsync(serverStream, clientStream, clientSettings,
-                                           frameHeader, frameHeaderBuf,
-                                           onBeforeResponse, queue.Reader, settingsAckChannel.Reader,
-                                           cts, exceptionFunc);
+            var readTask = ReadLoopAsync(
+                clientStream, clientSettings, new Http2FrameHeader(), new byte[9],
+                sessionFactory, onBeforeRequest, queue.Writer, clientWriteLock,
+                cts, exceptionFunc);
+
+            var writeTask = WriteLoopAsync(
+                serverStream, clientStream, clientSettings, new Http2FrameHeader(), new byte[9],
+                onBeforeResponse, queue.Reader, clientWriteLock, cts, exceptionFunc);
 
             await Task.WhenAny(readTask, writeTask);
             cts.Cancel();
             await Task.WhenAll(readTask, writeTask);
         }
 
-        // ── Read Loop: H2 client → queue ──────────────────────────────────────
-
+        /// <summary>
+        /// Continuously reads HTTP/2 frames from the client and handles them (HEADERS, DATA, SETTINGS, etc.).
+        /// </summary>
         private static async Task ReadLoopAsync(
             Stream clientStream,
             Http2Settings clientSettings,
@@ -82,58 +77,59 @@ namespace Titanium.Web.Proxy.Http2.Translation
             Func<SessionEventArgs> sessionFactory,
             Func<SessionEventArgs, Task> onBeforeRequest,
             ChannelWriter<Http2StreamContext> writer,
-            ChannelWriter<bool> settingsAckWriter,
+            SemaphoreSlim clientWriteLock,
             CancellationTokenSource cts,
             ExceptionHandler? exceptionFunc)
         {
             var ct = cts.Token;
             var dataBuffer = new byte[clientSettings.MaxFrameSize];
+            var pendingStreams = new Dictionary<int, Http2StreamContext>();
+            var pendingHeaderBlocks = new Dictionary<int, PendingHeaderBlock>();
 
-            // Active streams being assembled (waiting for EndHeaders / body frames)
-            var pendingStreams  = new Dictionary<int, Http2StreamContext>();
-            var pendingHeaders  = new Dictionary<int, MemoryStream>();
-
-            Decoder? decoder   = null;
-            int tableSize      = 0;
+            var decoderState = new HeaderDecoderState();
 
             try
             {
                 while (!ct.IsCancellationRequested)
                 {
-                    // Resize data buffer if settings changed
                     if (dataBuffer.Length < clientSettings.MaxFrameSize)
                         dataBuffer = new byte[clientSettings.MaxFrameSize];
 
                     if (!await Http2FrameReader.TryReadFrameHeaderAsync(clientStream, headerBuffer, frameHeader, ct))
                         break;
 
-                    int length   = frameHeader.Length;
+                    int length = frameHeader.Length;
                     int streamId = frameHeader.StreamId;
-                    var type     = frameHeader.Type;
-                    var flags    = frameHeader.Flags;
+                    var type = frameHeader.Type;
+                    var flags = frameHeader.Flags;
 
                     if (length > 0)
                     {
                         int read = await Http2FrameReader.ForceReadAsync(clientStream, dataBuffer, 0, length, ct);
-                        if (read != length) break;
+                        if (read != length)
+                            break;
                     }
 
-                    // ── Connection-level frames ───────────────────────────────
                     if (type == Http2FrameType.Settings)
                     {
                         if ((flags & Http2FrameFlag.Ack) == 0)
                         {
                             Http1ToHttp2Translator.ParseSettings(clientSettings, dataBuffer, length);
-                            // Signal WriteLoop to send SETTINGS ACK (keeps clientStream writes on one Task)
-                            settingsAckWriter.TryWrite(true);
+                            await WriteToClientAsync(clientWriteLock,
+                                () => Http2FrameWriter.SendSettingsAckAsync(clientStream, headerBuffer, ct));
                         }
                         continue;
                     }
 
                     if (type == Http2FrameType.Ping)
                     {
-                        // Ping ACK must go back to client — handled by WriteLoop via a dedicated channel
-                        // For simplicity, ignore ping in ReadLoop (WriteLoop can ACK).
+                        if ((flags & Http2FrameFlag.Ack) == 0 && streamId == 0 && length == 8)
+                        {
+                            var pingPayload = new byte[8];
+                            Array.Copy(dataBuffer, pingPayload, 8);
+                            await WriteToClientAsync(clientWriteLock,
+                                () => Http2FrameWriter.SendPingAckAsync(clientStream, headerBuffer, pingPayload, ct));
+                        }
                         continue;
                     }
 
@@ -141,112 +137,153 @@ namespace Titanium.Web.Proxy.Http2.Translation
                         type == Http2FrameType.Priority)
                         continue;
 
-                    if (type == Http2FrameType.GoAway) break;
+                    if (type == Http2FrameType.GoAway)
+                        break;
 
-                    // ── Stream HEADERS ────────────────────────────────────────
                     if (type == Http2FrameType.Headers)
                     {
-                        bool endHeaders  = (flags & Http2FrameFlag.EndHeaders)  != 0;
-                        bool endStream   = (flags & Http2FrameFlag.EndStream)   != 0;
-                        bool padded      = (flags & Http2FrameFlag.Padded)      != 0;
-                        bool priority    = (flags & Http2FrameFlag.Priority)    != 0;
+                        bool endHeaders = (flags & Http2FrameFlag.EndHeaders) != 0;
+                        bool endStream = (flags & Http2FrameFlag.EndStream) != 0;
+                        bool padded = (flags & Http2FrameFlag.Padded) != 0;
+                        bool priority = (flags & Http2FrameFlag.Priority) != 0;
 
-                        int offset   = 0;
-                        int padLen   = padded   ? dataBuffer[offset++] : 0;
-                        if (priority) offset += 5; // skip 5-byte priority block
+                        int offset = 0;
+                        int padLength = padded ? dataBuffer[offset++] : 0;
+                        if (priority) offset += 5;
 
-                        int blockLen = length - offset - padLen;
+                        int blockLength = length - offset - padLength;
+                        if (blockLength < 0)
+                        {
+                            exceptionFunc?.Invoke(new ProxyHttpException(
+                                "Invalid HTTP/2 HEADERS frame length.", null, null));
+                            break;
+                        }
 
-                        if (!pendingHeaders.TryGetValue(streamId, out var ms))
-                            pendingHeaders[streamId] = ms = new MemoryStream();
-                        ms.Write(dataBuffer, offset, blockLen);
+                        if (!pendingHeaderBlocks.TryGetValue(streamId, out var pendingHeader))
+                        {
+                            pendingHeader = new PendingHeaderBlock();
+                            pendingHeaderBlocks[streamId] = pendingHeader;
+                        }
+
+                        pendingHeader.EndStream = endStream;
+                        pendingHeader.Buffer.Write(dataBuffer, offset, blockLength);
 
                         if (endHeaders)
                         {
-                            var headerBlock = ms.ToArray();
-                            pendingHeaders.Remove(streamId);
-
-                            var decodedHeaders = DecodeHeaders(
-                                ref decoder, ref tableSize, clientSettings, headerBlock, exceptionFunc);
-
-                            var ctx  = new Http2StreamContext(streamId, sessionFactory());
-                            Http2HeaderConverter.ApplyToHttp1Request(ctx.Args.HttpClient.Request, decodedHeaders);
-                            ctx.Args.HttpClient.Request.SetOriginalHeaders();
-
-                            await onBeforeRequest(ctx.Args);
-
-                            if (endStream)
-                            {
-                                ctx.RequestBodyComplete = true;
-                                await writer.WriteAsync(ctx, ct);
-                            }
-                            else
-                            {
-                                pendingStreams[streamId] = ctx;
-                            }
+                            await FinalizeHeadersAsync(
+                                streamId, pendingHeaderBlocks, pendingStreams, sessionFactory, onBeforeRequest, writer,
+                                decoderState, clientSettings, ct, exceptionFunc);
                         }
+
                         continue;
                     }
 
-                    // ── CONTINUATION ──────────────────────────────────────────
                     if (type == Http2FrameType.Continuation)
                     {
                         bool endHeaders = (flags & Http2FrameFlag.EndHeaders) != 0;
-                        if (pendingHeaders.TryGetValue(streamId, out var ms))
+                        if (!pendingHeaderBlocks.TryGetValue(streamId, out var pendingHeader))
                         {
-                            ms.Write(dataBuffer, 0, length);
-                            if (endHeaders)
-                            {
-                                var headerBlock   = ms.ToArray();
-                                pendingHeaders.Remove(streamId);
-                                var decodedHeaders = DecodeHeaders(
-                                    ref decoder, ref tableSize, clientSettings, headerBlock, exceptionFunc);
-
-                                if (pendingStreams.TryGetValue(streamId, out var ctx))
-                                    Http2HeaderConverter.ApplyToHttp1Request(ctx.Args.HttpClient.Request, decodedHeaders);
-                            }
+                            exceptionFunc?.Invoke(new ProxyHttpException(
+                                $"Unexpected HTTP/2 CONTINUATION on stream {streamId}.", null, null));
+                            break;
                         }
+
+                        pendingHeader.Buffer.Write(dataBuffer, 0, length);
+
+                        if (endHeaders)
+                        {
+                            await FinalizeHeadersAsync(
+                                streamId, pendingHeaderBlocks, pendingStreams, sessionFactory, onBeforeRequest, writer,
+                                decoderState, clientSettings, ct, exceptionFunc);
+                        }
+
                         continue;
                     }
 
-                    // ── DATA ──────────────────────────────────────────────────
-                    if (type == Http2FrameType.Data && pendingStreams.TryGetValue(streamId, out var stream))
+                    if (type == Http2FrameType.Data && pendingStreams.TryGetValue(streamId, out var streamContext))
                     {
-                        bool padded2  = (flags & Http2FrameFlag.Padded)    != 0;
+                        bool padded = (flags & Http2FrameFlag.Padded) != 0;
                         bool endStream = (flags & Http2FrameFlag.EndStream) != 0;
-                        int  offset2  = 0;
-                        int  padLen2  = padded2 ? dataBuffer[offset2++] : 0;
-                        int  dataLen  = length - offset2 - padLen2;
+                        int offset = 0;
+                        int padLength = padded ? dataBuffer[offset++] : 0;
+                        int dataLength = length - offset - padLength;
 
-                        stream.RequestBody ??= new MemoryStream();
-                        stream.RequestBody.Write(dataBuffer, offset2, dataLen);
+                        if (dataLength < 0)
+                        {
+                            exceptionFunc?.Invoke(new ProxyHttpException(
+                                $"Invalid HTTP/2 DATA frame on stream {streamId}.", null, streamContext.Args));
+                            break;
+                        }
+
+                        streamContext.RequestBody ??= new MemoryStream();
+                        streamContext.RequestBody.Write(dataBuffer, offset, dataLength);
 
                         if (endStream)
                         {
-                            stream.RequestBodyComplete = true;
+                            streamContext.RequestBodyComplete = true;
                             pendingStreams.Remove(streamId);
-                            await writer.WriteAsync(stream, ct);
+                            await writer.WriteAsync(streamContext, ct);
                         }
+
                         continue;
                     }
 
-                    // ── RST_STREAM ────────────────────────────────────────────
-                    if (type == Http2FrameType.RstStream && pendingStreams.ContainsKey(streamId))
+                    if (type == Http2FrameType.RstStream)
                     {
                         pendingStreams.Remove(streamId);
+                        pendingHeaderBlocks.Remove(streamId);
                     }
                 }
             }
-            catch (OperationCanceledException) { /* expected on shutdown */ }
+            catch (OperationCanceledException)
+            {
+            }
             finally
             {
                 writer.TryComplete();
-                settingsAckWriter.TryComplete();
             }
         }
 
-        // ── Write Loop: queue → H1 server → H2 client ────────────────────────
+        /// <summary>
+        /// Finalizes the decoding of headers for a stream and triggers the before-request hook.
+        /// </summary>
+        private static async Task FinalizeHeadersAsync(
+            int streamId,
+            IDictionary<int, PendingHeaderBlock> pendingHeaderBlocks,
+            IDictionary<int, Http2StreamContext> pendingStreams,
+            Func<SessionEventArgs> sessionFactory,
+            Func<SessionEventArgs, Task> onBeforeRequest,
+            ChannelWriter<Http2StreamContext> writer,
+            HeaderDecoderState decoderState,
+            Http2Settings clientSettings,
+            CancellationToken ct,
+            ExceptionHandler? exceptionFunc)
+        {
+            var pendingHeader = pendingHeaderBlocks[streamId];
+            pendingHeaderBlocks.Remove(streamId);
 
+            var decodedHeaders = DecodeHeaders(decoderState, clientSettings, pendingHeader.Buffer.ToArray(), exceptionFunc);
+
+            var context = new Http2StreamContext(streamId, sessionFactory());
+            Http2HeaderConverter.ApplyToHttp1Request(context.Args.HttpClient.Request, decodedHeaders);
+            context.Args.HttpClient.Request.SetOriginalHeaders();
+
+            await onBeforeRequest(context.Args);
+
+            if (pendingHeader.EndStream)
+            {
+                context.RequestBodyComplete = true;
+                await writer.WriteAsync(context, ct);
+            }
+            else
+            {
+                pendingStreams[streamId] = context;
+            }
+        }
+
+        /// <summary>
+        /// Reads captured HTTP/2 streams from the queue and executes them against the HTTP/1.x server.
+        /// </summary>
         private static async Task WriteLoopAsync(
             Stream serverStream,
             Stream clientStream,
@@ -255,96 +292,85 @@ namespace Titanium.Web.Proxy.Http2.Translation
             byte[] headerBuffer,
             Func<SessionEventArgs, Task> onBeforeResponse,
             ChannelReader<Http2StreamContext> reader,
-            ChannelReader<bool> settingsAckReader,
+            SemaphoreSlim clientWriteLock,
             CancellationTokenSource cts,
             ExceptionHandler? exceptionFunc)
         {
-            var ct           = cts.Token;
+            var ct = cts.Token;
             var encoderState = new Http2EncoderState();
-            var dataBuffer   = new byte[clientSettings.MaxFrameSize];
-
-            // Bug #4 Fix: send empty SETTINGS (connection preface), NOT SETTINGS ACK.
-            // RFC 7540 §3.5: when acting as an HTTP/2 server, the preface is a SETTINGS frame.
-            await Http2FrameWriter.SendSettingsAsync(clientStream, headerBuffer, ct);
-
-            // Helper: flush any pending SETTINGS ACK signals from ReadLoop.
-            // All clientStream writes are serialized here in WriteLoop.
-            async Task SendPendingSettingsAcksAsync()
-            {
-                while (settingsAckReader.TryRead(out _))
-                    await Http2FrameWriter.SendSettingsAckAsync(clientStream, headerBuffer, ct);
-            }
-
-            // Send ACK for the client's initial SETTINGS (sent right after its preface).
-            // The ReadLoop will have signalled us via settingsAckChannel.
-            // Allow a short cooperative yield so ReadLoop can process the SETTINGS frame first.
-            await Task.Yield();
-            await SendPendingSettingsAcksAsync();
+            var dataBuffer = new byte[clientSettings.MaxFrameSize];
 
             try
             {
-                await foreach (var ctx in reader.ReadAllAsync(ct))
+                await foreach (var context in reader.ReadAllAsync(ct))
                 {
                     try
                     {
-                        var request  = ctx.Args.HttpClient.Request;
-                        var response = ctx.Args.HttpClient.Response;
+                        var request = context.Args.HttpClient.Request;
+                        var response = context.Args.HttpClient.Response;
 
-                        // ── Send H1 request to server ─────────────────────────
-                        await SendH1RequestAsync(serverStream, request, ctx.RequestBody, ct);
+                        await SendH1RequestAsync(serverStream, request, context.RequestBody, ct);
 
-                        // ── Read H1 response from server ──────────────────────
+                        response.RequestMethod = request.Method;
                         await ReadH1ResponseAsync(serverStream, response, ct);
 
-                        // Fire before-response hook
-                        await onBeforeResponse(ctx.Args);
+                        await onBeforeResponse(context.Args);
 
-                        // ── Convert H1 response to H2 HEADERS + DATA frames ───
                         var h2ResponseHeaders = Http2HeaderConverter.ToHttp2ResponseHeaders(response);
                         bool hasBody = response.IsBodyRead && response.Body?.Length > 0;
 
-                        await SendH2HeadersToClientAsync(
-                            clientStream, clientSettings, encoderState,
-                            frameHeader, headerBuffer,
-                            h2ResponseHeaders, ctx.StreamId, !hasBody, ct);
+                        await WriteToClientAsync(clientWriteLock,
+                            () => SendH2HeadersToClientAsync(
+                                clientStream, clientSettings, encoderState,
+                                frameHeader, headerBuffer,
+                                h2ResponseHeaders, context.StreamId, !hasBody, ct));
 
                         if (hasBody)
                         {
-                            await SendH2DataToClientAsync(
-                                clientStream, clientSettings,
-                                frameHeader, headerBuffer, dataBuffer,
-                                response.Body!, ctx.StreamId, ct);
+                            await WriteToClientAsync(clientWriteLock,
+                                () => SendH2DataToClientAsync(
+                                    clientStream, clientSettings,
+                                    frameHeader, headerBuffer, dataBuffer,
+                                    response.Body!, context.StreamId, ct));
                         }
-
-                        // ACK any SETTINGS frames received while we were processing this request
-                        await SendPendingSettingsAcksAsync();
                     }
                     catch (Exception ex) when (!(ex is OperationCanceledException))
                     {
                         exceptionFunc?.Invoke(new ProxyHttpException(
-                            $"Error translating H2→H1 stream {ctx.StreamId}", ex, ctx.Args));
-                        await Http2FrameWriter.SendRstStreamAsync(
-                            clientStream, headerBuffer, ctx.StreamId, 0x2 /* INTERNAL_ERROR */, ct);
+                            $"Error translating H2 to H1 stream {context.StreamId}", ex, context.Args));
+
+                        await WriteToClientAsync(clientWriteLock,
+                            () => Http2FrameWriter.SendRstStreamAsync(
+                                clientStream, headerBuffer, context.StreamId, 0x2, ct));
                     }
                     finally
                     {
-                        ctx.Args.Dispose();
+                        context.Args.Dispose();
                     }
                 }
             }
-            catch (OperationCanceledException) { /* shutdown */ }
+            catch (OperationCanceledException)
+            {
+            }
         }
 
-
-        // ── H1 send/receive helpers ───────────────────────────────────────────
-
-        private static async Task SendH1RequestAsync(Stream server, Request request, MemoryStream? body, CancellationToken ct)
+        /// <summary>
+        /// Formats and sends an HTTP/1.x request to the server.
+        /// </summary>
+        private static async Task SendH1RequestAsync(
+            Stream server, Request request, MemoryStream? body, CancellationToken ct)
         {
-            var hb = new HeaderBuilder();
-            hb.WriteRequestLine(request.Method, request.RequestUri.PathAndQuery, HttpHeader.Version11);
-            hb.WriteHeaders(request.Headers);
-            var buf = hb.GetBuffer();
-            await server.WriteAsync(buf.Array!, buf.Offset, buf.Count, ct);
+            if (body != null)
+            {
+                request.Headers.RemoveHeader(KnownHeaders.TransferEncoding);
+                request.ContentLength = body.Length;
+            }
+
+            var headerBuilder = new HeaderBuilder();
+            headerBuilder.WriteRequestLine(request.Method, request.RequestUri.PathAndQuery, HttpHeader.Version11);
+            headerBuilder.WriteHeaders(request.Headers);
+            var headerBuffer = headerBuilder.GetBuffer();
+            await server.WriteAsync(headerBuffer.Array!, headerBuffer.Offset, headerBuffer.Count, ct);
 
             if (body != null && body.Length > 0)
             {
@@ -355,62 +381,164 @@ namespace Titanium.Web.Proxy.Http2.Translation
             await server.FlushAsync(ct);
         }
 
+        /// <summary>
+        /// Reads an HTTP/1.x response from the server and populates the <see cref="Response"/> object.
+        /// </summary>
         private static async Task ReadH1ResponseAsync(Stream server, Response response, CancellationToken ct)
         {
-            // Read status line
             string? statusLine = await ReadLineFromStreamAsync(server, ct);
-            if (string.IsNullOrEmpty(statusLine)) return;
+            if (string.IsNullOrEmpty(statusLine))
+                return;
 
-            // Parse status line manually: "HTTP/1.1 200 OK"
             var parts = statusLine.Split(new[] { ' ' }, 3);
-            response.HttpVersion       = parts[0].EndsWith("1.0") ? HttpHeader.Version10 : HttpHeader.Version11;
-            response.StatusCode        = parts.Length > 1 && int.TryParse(parts[1], out var sc) ? sc : 200;
+            response.HttpVersion = parts[0].EndsWith("1.0", StringComparison.Ordinal)
+                ? HttpHeader.Version10
+                : HttpHeader.Version11;
+            response.StatusCode = parts.Length > 1 && int.TryParse(parts[1], out var statusCode) ? statusCode : 200;
             response.StatusDescription = parts.Length > 2 ? parts[2] : string.Empty;
 
-            // Read headers
             while (true)
             {
                 var line = await ReadLineFromStreamAsync(server, ct);
-                if (string.IsNullOrEmpty(line)) break;
+                if (string.IsNullOrEmpty(line))
+                    break;
 
                 int colon = line.IndexOf(':');
-                if (colon < 0) continue;
+                if (colon < 0)
+                    continue;
+
                 response.Headers.AddHeader(new HttpHeader(
                     line.Substring(0, colon).Trim(),
                     line.Substring(colon + 1).Trim()));
             }
 
-            // Read body based on content-length
-            if (response.ContentLength > 0)
+            response.SetOriginalHeaders();
+
+            if (!response.HasBody)
+                return;
+
+            byte[] bodyBytes;
+            if (response.IsChunked)
             {
-                var bodyBytes = new byte[response.ContentLength];
-                int totalRead = 0;
-                while (totalRead < bodyBytes.Length)
+                bodyBytes = await ReadChunkedBodyAsync(server, ct);
+            }
+            else if (response.ContentLength >= 0)
+            {
+                bodyBytes = await ReadFixedLengthBodyAsync(server, response.ContentLength, ct);
+            }
+            else if (!response.KeepAlive || response.HttpVersion == HttpHeader.Version10)
+            {
+                bodyBytes = await ReadUntilEofAsync(server, ct);
+            }
+            else
+            {
+                bodyBytes = Array.Empty<byte>();
+            }
+
+            response.Body = bodyBytes;
+            response.IsBodyRead = true;
+        }
+
+        private static async Task<byte[]> ReadFixedLengthBodyAsync(Stream stream, long contentLength, CancellationToken ct)
+        {
+            if (contentLength <= 0)
+                return Array.Empty<byte>();
+
+            var body = new byte[contentLength];
+            int totalRead = 0;
+            while (totalRead < body.Length)
+            {
+                int read = await stream.ReadAsync(body, totalRead, body.Length - totalRead, ct);
+                if (read == 0)
+                    throw new IOException("Unexpected end of HTTP/1.x response body.");
+
+                totalRead += read;
+            }
+
+            return body;
+        }
+
+        private static async Task<byte[]> ReadChunkedBodyAsync(Stream stream, CancellationToken ct)
+        {
+            using var body = new MemoryStream();
+
+            while (true)
+            {
+                var chunkHead = await ReadLineFromStreamAsync(stream, ct);
+                if (chunkHead == null)
+                    throw new IOException("Unexpected end of chunked response body.");
+
+                int separatorIndex = chunkHead.IndexOf(';');
+                if (separatorIndex >= 0)
+                    chunkHead = chunkHead.Substring(0, separatorIndex);
+
+                if (!int.TryParse(chunkHead, System.Globalization.NumberStyles.HexNumber, null, out int chunkSize))
+                    throw new ProxyHttpException($"Invalid chunk length: '{chunkHead}'", null, null);
+
+                if (chunkSize == 0)
                 {
-                    int read = await server.ReadAsync(bodyBytes, totalRead, (int)(bodyBytes.Length - totalRead), ct);
-                    if (read == 0) break;
-                    totalRead += read;
+                    await ConsumeChunkTrailersAsync(stream, ct);
+                    break;
                 }
-                response.Body       = bodyBytes;
-                response.IsBodyRead = true;
+
+                var chunk = await ReadFixedLengthBodyAsync(stream, chunkSize, ct);
+                await body.WriteAsync(chunk, 0, chunk.Length, ct);
+
+                var chunkTerminator = await ReadLineFromStreamAsync(stream, ct);
+                if (chunkTerminator == null)
+                    throw new IOException("Unexpected end of chunked response terminator.");
+            }
+
+            return body.ToArray();
+        }
+
+        private static async Task<byte[]> ReadUntilEofAsync(Stream stream, CancellationToken ct)
+        {
+            using var body = new MemoryStream();
+            var buffer = new byte[8192];
+
+            while (true)
+            {
+                int read = await stream.ReadAsync(buffer, 0, buffer.Length, ct);
+                if (read == 0)
+                    break;
+
+                await body.WriteAsync(buffer, 0, read, ct);
+            }
+
+            return body.ToArray();
+        }
+
+        private static async Task ConsumeChunkTrailersAsync(Stream stream, CancellationToken ct)
+        {
+            while (true)
+            {
+                var trailerLine = await ReadLineFromStreamAsync(stream, ct);
+                if (trailerLine == null || trailerLine.Length == 0)
+                    return;
             }
         }
 
         private static async Task<string?> ReadLineFromStreamAsync(Stream stream, CancellationToken ct)
         {
-            var buf     = new List<byte>(256);
+            var bytes = new List<byte>(256);
             var oneByte = new byte[1];
+
             while (true)
             {
                 int read = await stream.ReadAsync(oneByte, 0, 1, ct);
-                if (read == 0) return null;
-                if (oneByte[0] == '\n') break;
-                if (oneByte[0] != '\r') buf.Add(oneByte[0]);
-            }
-            return System.Text.Encoding.ASCII.GetString(buf.ToArray());
-        }
+                if (read == 0)
+                    return bytes.Count == 0 ? null : System.Text.Encoding.ASCII.GetString(bytes.ToArray());
 
-        // ── H2 response send helpers ──────────────────────────────────────────
+                if (oneByte[0] == '\n')
+                    break;
+
+                if (oneByte[0] != '\r')
+                    bytes.Add(oneByte[0]);
+            }
+
+            return System.Text.Encoding.ASCII.GetString(bytes.ToArray());
+        }
 
         private static async Task SendH2HeadersToClientAsync(
             Stream clientStream, Http2Settings clientSettings, Http2EncoderState encoderState,
@@ -422,8 +550,8 @@ namespace Titanium.Web.Proxy.Http2.Translation
             EnsureEncoder(encoderState, clientSettings);
             var encoder = encoderState.Encoder!;
 
-            using var ms     = new MemoryStream();
-            var       writer = new BinaryWriter(ms);
+            using var ms = new MemoryStream();
+            var writer = new BinaryWriter(ms);
 
             foreach (var (name, value) in headers)
             {
@@ -433,17 +561,17 @@ namespace Titanium.Web.Proxy.Http2.Translation
             }
 
             var encoded = ms.ToArray();
-            var flags   = Http2FrameFlag.EndHeaders;
+            var flags = Http2FrameFlag.EndHeaders;
             if (endStream) flags |= Http2FrameFlag.EndStream;
 
-            frameHeader.Length   = encoded.Length;
-            frameHeader.Type     = Http2FrameType.Headers;
-            frameHeader.Flags    = flags;
+            frameHeader.Length = encoded.Length;
+            frameHeader.Type = Http2FrameType.Headers;
+            frameHeader.Flags = flags;
             frameHeader.StreamId = streamId;
             frameHeader.CopyToBuffer(headerBuffer);
 
-            await clientStream.WriteAsync(headerBuffer, 0, 9,              ct);
-            await clientStream.WriteAsync(encoded,      0, encoded.Length, ct);
+            await clientStream.WriteAsync(headerBuffer, 0, 9, ct);
+            await clientStream.WriteAsync(encoded, 0, encoded.Length, ct);
         }
 
         private static async Task SendH2DataToClientAsync(
@@ -451,47 +579,50 @@ namespace Titanium.Web.Proxy.Http2.Translation
             Http2FrameHeader frameHeader, byte[] headerBuffer, byte[] dataBuffer,
             byte[] body, int streamId, CancellationToken ct)
         {
-            int pos = 0;
-            while (pos < body.Length)
+            int position = 0;
+            while (position < body.Length)
             {
-                int chunkLen = Math.Min(dataBuffer.Length, body.Length - pos);
-                Buffer.BlockCopy(body, pos, dataBuffer, 0, chunkLen);
-                pos += chunkLen;
+                int chunkLength = Math.Min(dataBuffer.Length, body.Length - position);
+                Buffer.BlockCopy(body, position, dataBuffer, 0, chunkLength);
+                position += chunkLength;
 
-                frameHeader.Length   = chunkLen;
-                frameHeader.Type     = Http2FrameType.Data;
-                frameHeader.Flags    = pos >= body.Length ? Http2FrameFlag.EndStream : (Http2FrameFlag)0;
+                frameHeader.Length = chunkLength;
+                frameHeader.Type = Http2FrameType.Data;
+                frameHeader.Flags = position >= body.Length ? Http2FrameFlag.EndStream : (Http2FrameFlag)0;
                 frameHeader.StreamId = streamId;
                 frameHeader.CopyToBuffer(headerBuffer);
 
-                await clientStream.WriteAsync(headerBuffer, 0, 9,         ct);
-                await clientStream.WriteAsync(dataBuffer,   0, chunkLen,  ct);
+                await clientStream.WriteAsync(headerBuffer, 0, 9, ct);
+                await clientStream.WriteAsync(dataBuffer, 0, chunkLength, ct);
             }
         }
 
-        // ── HPACK helpers ─────────────────────────────────────────────────────
-
+        /// <summary>
+        /// Decodes a block of HPACK-encoded headers.
+        /// </summary>
         private static IReadOnlyList<(string, string)> DecodeHeaders(
-            ref Decoder? decoder, ref int tableSize,
+            HeaderDecoderState decoderState,
             Http2Settings settings, byte[] block,
             ExceptionHandler? exceptionFunc)
         {
             var list = new List<(string, string)>();
             try
             {
-                if (decoder == null || tableSize < settings.HeaderTableSize)
+                if (decoderState.Decoder == null || decoderState.TableSize < settings.HeaderTableSize)
                 {
-                    tableSize = settings.HeaderTableSize;
-                    decoder   = new Decoder(8192, tableSize);
+                    decoderState.TableSize = settings.HeaderTableSize;
+                    decoderState.Decoder = new Decoder(8192, decoderState.TableSize);
                 }
+
                 var listener = new SimpleHeaderListener(list);
-                decoder.Decode(new BinaryReader(new MemoryStream(block)), listener);
-                decoder.EndHeaderBlock();
+                decoderState.Decoder.Decode(new BinaryReader(new MemoryStream(block)), listener);
+                decoderState.Decoder.EndHeaderBlock();
             }
             catch (Exception ex)
             {
                 exceptionFunc?.Invoke(new ProxyHttpException("Failed to decode H2 request headers", ex, null));
             }
+
             return list;
         }
 
@@ -508,28 +639,58 @@ namespace Titanium.Web.Proxy.Http2.Translation
             }
         }
 
+        private static async Task WriteToClientAsync(SemaphoreSlim clientWriteLock, Func<Task> writeFunc)
+        {
+            await clientWriteLock.WaitAsync();
+            try
+            {
+                await writeFunc();
+            }
+            finally
+            {
+                clientWriteLock.Release();
+            }
+        }
+
         private sealed class SimpleHeaderListener : IHeaderListener
         {
             private readonly List<(string, string)> _list;
-            public SimpleHeaderListener(List<(string, string)> list) => _list = list;
-            public void AddHeader(ByteString name, ByteString value, bool sensitive)
-                => _list.Add((name.GetString(), value.GetString()));
-        }
 
-        // ── Stream context ────────────────────────────────────────────────────
+            public SimpleHeaderListener(List<(string, string)> list)
+            {
+                _list = list;
+            }
+
+            public void AddHeader(ByteString name, ByteString value, bool sensitive)
+            {
+                _list.Add((name.GetString(), value.GetString()));
+            }
+        }
 
         private sealed class Http2StreamContext
         {
-            public int              StreamId            { get; }
-            public SessionEventArgs Args                { get; }
-            public MemoryStream?    RequestBody         { get; set; }
-            public bool             RequestBodyComplete { get; set; }
+            public int StreamId { get; }
+            public SessionEventArgs Args { get; }
+            public MemoryStream? RequestBody { get; set; }
+            public bool RequestBodyComplete { get; set; }
 
             public Http2StreamContext(int streamId, SessionEventArgs args)
             {
                 StreamId = streamId;
-                Args     = args;
+                Args = args;
             }
+        }
+
+        private sealed class PendingHeaderBlock
+        {
+            public MemoryStream Buffer { get; } = new MemoryStream();
+            public bool EndStream { get; set; }
+        }
+
+        private sealed class HeaderDecoderState
+        {
+            public Decoder? Decoder { get; set; }
+            public int TableSize { get; set; }
         }
     }
 }

@@ -312,10 +312,6 @@ namespace Titanium.Web.Proxy
 
                 if (clientIsH1 && serverIsH2)
                 {
-                    // Send HTTP/2 connection preface to server before translator starts its loops
-                    var preface = new ReadOnlyMemory<byte>(Http2Helper.ConnectionPreface);
-                    await connection.Stream.WriteAsync(preface, cancellationToken);
-
                     IHttp2Translator translator = new Http1ToHttp2Translator();
                     await translator.TranslateAsync(
                         args.ClientStream,

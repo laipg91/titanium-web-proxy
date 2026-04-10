@@ -1,8 +1,6 @@
 #if NET6_0_OR_GREATER
 using System;
 using System.Collections.Generic;
-using System.Net;
-using System.Text;
 using Titanium.Web.Proxy.Http;
 using Titanium.Web.Proxy.Models;
 
@@ -10,125 +8,140 @@ namespace Titanium.Web.Proxy.Http2.Translation
 {
     /// <summary>
     /// Converts HTTP/1.x headers to/from HTTP/2 pseudo-headers.
-    /// RFC 7540 §8.1.2 — HTTP Header Fields.
-    ///
-    /// Single responsibility: header translation only.
-    /// No I/O, no state, all methods are pure.
+    /// RFC 9113 forbids connection-specific fields in HTTP/2, and RFC 9110
+    /// requires intermediaries to strip fields named by Connection.
     /// </summary>
     internal static class Http2HeaderConverter
     {
-        // ── Hop-by-hop headers (RFC 7540 §8.1.2.2) ───────────────────────────
-        // These MUST NOT be forwarded in HTTP/2 frames.
-        private static readonly HashSet<string> HopByHopHeaders =
+        private static readonly HashSet<string> CommonForbiddenHeaders =
             new(StringComparer.OrdinalIgnoreCase)
             {
                 "connection",
                 "keep-alive",
                 "proxy-connection",
                 "transfer-encoding",
-                "te",
                 "upgrade",
-                "proxy-authorization",
             };
 
-        // ── H1 → H2 ──────────────────────────────────────────────────────────
+        private static readonly HashSet<string> RequestForbiddenHeaders =
+            new(StringComparer.OrdinalIgnoreCase)
+            {
+                "proxy-authorization",
+                "host",
+                "http2-settings",
+            };
 
-        /// <summary>
-        /// Builds the complete list of HTTP/2 headers (pseudo-headers first, then regular)
-        /// from an HTTP/1.x <see cref="Request"/>.
-        /// Strips hop-by-hop headers that are forbidden in HTTP/2.
-        /// </summary>
+        private static readonly HashSet<string> ResponseForbiddenHeaders =
+            new(StringComparer.OrdinalIgnoreCase)
+            {
+                "proxy-authenticate",
+                "proxy-authentication-info",
+                "te",
+            };
+
         internal static IReadOnlyList<(string Name, string Value)> ToHttp2RequestHeaders(Request request)
         {
-            var uri    = request.RequestUri;
+            var uri = request.RequestUri;
             var scheme = request.IsHttps ? "https" : "http";
-            var path   = string.IsNullOrEmpty(uri.PathAndQuery) ? "/" : uri.PathAndQuery;
+            var path = string.IsNullOrEmpty(uri.PathAndQuery) ? "/" : uri.PathAndQuery;
+            var connectionTokens = GetConnectionHeaderTokens(request.Headers);
 
-            var headers = new List<(string, string)>()
+            var headers = new List<(string, string)>
             {
-                (":method",    request.Method),
+                (":method", request.Method),
                 (":authority", uri.Authority),
-                (":scheme",    scheme),
-                (":path",      path),
+                (":scheme", scheme),
+                (":path", path),
             };
 
-            foreach (var h in request.Headers)
+            foreach (var header in request.Headers)
             {
-                if (!HopByHopHeaders.Contains(h.Name))
-                    headers.Add((h.Name.ToLowerInvariant(), h.Value));
+                if (ShouldSkipRequestHeader(header.Name, connectionTokens))
+                    continue;
+
+                if (header.Name.Equals("te", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (TryNormalizeTeForHttp2(header.Value, out var normalizedTe))
+                        headers.Add(("te", normalizedTe));
+
+                    continue;
+                }
+
+                headers.Add((header.Name.ToLowerInvariant(), header.Value));
             }
 
             return headers;
         }
 
-        /// <summary>
-        /// Builds the complete list of HTTP/2 headers (pseudo-header first, then regular)
-        /// from an HTTP/1.x <see cref="Response"/>.
-        /// Strips hop-by-hop headers.
-        /// </summary>
         internal static IReadOnlyList<(string Name, string Value)> ToHttp2ResponseHeaders(Response response)
         {
-            var headers = new List<(string, string)>()
+            var connectionTokens = GetConnectionHeaderTokens(response.Headers);
+
+            var headers = new List<(string, string)>
             {
                 (":status", response.StatusCode.ToString()),
             };
 
-            foreach (var h in response.Headers)
+            foreach (var header in response.Headers)
             {
-                if (!HopByHopHeaders.Contains(h.Name))
-                    headers.Add((h.Name.ToLowerInvariant(), h.Value));
+                if (ShouldSkipResponseHeader(header.Name, connectionTokens))
+                    continue;
+
+                headers.Add((header.Name.ToLowerInvariant(), header.Value));
             }
 
             return headers;
         }
 
-        // ── H2 → H1 ──────────────────────────────────────────────────────────
-
-        /// <summary>
-        /// Applies decoded HTTP/2 headers to an HTTP/1.x <see cref="Request"/>.
-        /// Pseudo-headers are mapped to request fields; regular headers are added to the collection.
-        /// </summary>
         internal static void ApplyToHttp1Request(
             Request request,
             IReadOnlyList<(string Name, string Value)> headers)
         {
-            string method    = string.Empty;
-            string path      = "/";
+            string method = string.Empty;
+            string path = "/";
             string authority = string.Empty;
-            string scheme    = string.Empty;
+            string scheme = string.Empty;
 
-            // First pass: extract pseudo-headers
             foreach (var (name, value) in headers)
             {
-                if (name.Length == 0) continue;
-                if (name[0] != ':')   continue;
+                if (name.Length == 0 || name[0] != ':')
+                    continue;
 
                 switch (name)
                 {
-                    case ":method":    method    = value; break;
-                    case ":path":      path      = value; break;
-                    case ":authority": authority = value; break;
-                    case ":scheme":    scheme    = value; break;
+                    case ":method":
+                        method = value;
+                        break;
+                    case ":path":
+                        path = value;
+                        break;
+                    case ":authority":
+                        authority = value;
+                        break;
+                    case ":scheme":
+                        scheme = value;
+                        break;
                 }
             }
 
-            request.Method        = method;
-            request.IsHttps       = string.Equals(scheme, "https", StringComparison.OrdinalIgnoreCase);
-            request.HttpVersion   = HttpHeader.Version11;
-            request.Authority     = (ByteString)authority;
+            request.Method = method;
+            request.IsHttps = string.Equals(scheme, "https", StringComparison.OrdinalIgnoreCase);
+            request.HttpVersion = HttpHeader.Version11;
+            request.Authority = (ByteString)authority;
+            request.RequestUriString8 = (ByteString)$"{scheme}://{authority}{path}";
 
-            // Build an absolute-form URI so request.RequestUri works correctly
-            var uriString = $"{scheme}://{authority}{path}";
-            request.RequestUriString8 = (ByteString)uriString;
-
-            // Second pass: regular headers (skip pseudo-headers)
+            var connectionTokens = GetConnectionHeaderTokens(headers);
             foreach (var (name, value) in headers)
             {
-                if (name.Length == 0 || name[0] == ':') continue;
+                if (name.Length == 0 || name[0] == ':')
+                    continue;
+
+                if (ShouldSkipRequestHeader(name, connectionTokens))
+                    continue;
+
                 request.Headers.AddHeader(new HttpHeader(name, value));
             }
 
-            // Ensure Host header is present for HTTP/1.1 compatibility
             if (request.Headers.GetHeaderValueOrNull(KnownHeaders.Host) == null &&
                 !string.IsNullOrEmpty(authority))
             {
@@ -136,27 +149,30 @@ namespace Titanium.Web.Proxy.Http2.Translation
             }
         }
 
-        /// <summary>
-        /// Applies decoded HTTP/2 response headers to an HTTP/1.x <see cref="Response"/>.
-        /// Pseudo-header <c>:status</c> is mapped to <see cref="Response.StatusCode"/>.
-        /// </summary>
         internal static void ApplyToHttp1Response(
             Response response,
             IReadOnlyList<(string Name, string Value)> headers)
         {
+            var connectionTokens = GetConnectionHeaderTokens(headers);
+
             foreach (var (name, value) in headers)
             {
-                if (name.Length == 0) continue;
+                if (name.Length == 0)
+                    continue;
 
                 if (name[0] == ':')
                 {
                     if (name == ":status" && int.TryParse(value, out int code))
                     {
-                        response.StatusCode        = code;
+                        response.StatusCode = code;
                         response.StatusDescription = GetStatusDescription(code);
                     }
+
                     continue;
                 }
+
+                if (ShouldSkipResponseHeader(name, connectionTokens))
+                    continue;
 
                 response.Headers.AddHeader(new HttpHeader(name, value));
             }
@@ -164,7 +180,81 @@ namespace Titanium.Web.Proxy.Http2.Translation
             response.HttpVersion = HttpHeader.Version11;
         }
 
-        // ── Helpers ───────────────────────────────────────────────────────────
+        private static bool ShouldSkipRequestHeader(string name, HashSet<string> connectionTokens)
+        {
+            return CommonForbiddenHeaders.Contains(name) ||
+                   RequestForbiddenHeaders.Contains(name) ||
+                   connectionTokens.Contains(name);
+        }
+
+        private static bool ShouldSkipResponseHeader(string name, HashSet<string> connectionTokens)
+        {
+            return CommonForbiddenHeaders.Contains(name) ||
+                   ResponseForbiddenHeaders.Contains(name) ||
+                   connectionTokens.Contains(name);
+        }
+
+        private static HashSet<string> GetConnectionHeaderTokens(HeaderCollection headers)
+        {
+            return GetConnectionHeaderTokens(headers.GetHeaderValueOrNull(KnownHeaders.Connection));
+        }
+
+        private static HashSet<string> GetConnectionHeaderTokens(IReadOnlyList<(string Name, string Value)> headers)
+        {
+            var tokens = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            foreach (var (name, value) in headers)
+            {
+                if (name.Equals("connection", StringComparison.OrdinalIgnoreCase))
+                    AddConnectionHeaderTokens(tokens, value);
+            }
+
+            return tokens;
+        }
+
+        private static HashSet<string> GetConnectionHeaderTokens(string? connection)
+        {
+            var tokens = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            AddConnectionHeaderTokens(tokens, connection);
+            return tokens;
+        }
+
+        private static void AddConnectionHeaderTokens(HashSet<string> tokens, string? connection)
+        {
+            if (string.IsNullOrWhiteSpace(connection))
+                return;
+
+            foreach (var part in connection.Split(','))
+            {
+                var token = part.Trim();
+                if (token.Length != 0)
+                    tokens.Add(token);
+            }
+        }
+
+        private static bool TryNormalizeTeForHttp2(string value, out string normalized)
+        {
+            normalized = string.Empty;
+
+            if (string.IsNullOrWhiteSpace(value))
+                return false;
+
+            foreach (var part in value.Split(','))
+            {
+                var token = part.Trim();
+                var parameterIndex = token.IndexOf(';');
+                if (parameterIndex >= 0)
+                    token = token.Substring(0, parameterIndex).Trim();
+
+                if (token.Equals("trailers", StringComparison.OrdinalIgnoreCase))
+                {
+                    normalized = "trailers";
+                    return true;
+                }
+            }
+
+            return false;
+        }
 
         private static string GetStatusDescription(int code) => code switch
         {
@@ -186,7 +276,7 @@ namespace Titanium.Web.Proxy.Http2.Translation
             502 => "Bad Gateway",
             503 => "Service Unavailable",
             504 => "Gateway Timeout",
-            _   => string.Empty,
+            _ => string.Empty,
         };
     }
 }

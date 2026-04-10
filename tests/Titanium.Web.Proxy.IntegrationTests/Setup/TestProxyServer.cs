@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Net;
 using Titanium.Web.Proxy.Models;
 using Titanium.Web.Proxy.Network;
@@ -7,9 +7,10 @@ namespace Titanium.Web.Proxy.IntegrationTests.Setup;
 
 public class TestProxyServer : IDisposable
 {
-    public TestProxyServer(bool isReverseProxy, ProxyServer upStreamProxy = null)
+    public TestProxyServer(bool isReverseProxy, ProxyServer upStreamProxy = null, bool enableHttp2 = false)
     {
         ProxyServer = new ProxyServer();
+        ProxyServer.EnableHttp2 = enableHttp2;
 
         var explicitEndPoint = isReverseProxy
             ? (ProxyEndPoint)new TransparentProxyEndPoint(IPAddress.Any, 0)

@@ -49,8 +49,8 @@ namespace Titanium.Web.Proxy.Http2
         public int MaxHeaderListSize { get; set; } = int.MaxValue;
 
         /// <summary>
-        /// The current flow-control window size for the entire connection.
-        /// Starts at the default initial window size.
+        /// The current flow-control window size for the entire HTTP/2 connection.
+        /// Starts at the default initial window size (65535) and is updated via WINDOW_UPDATE frames at stream 0.
         /// </summary>
         public int ConnectionWindowSize { get; set; } = 65535;
     }

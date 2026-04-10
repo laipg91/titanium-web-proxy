@@ -21,14 +21,20 @@ using Encoder = Titanium.Web.Proxy.Http2.Hpack.Encoder;
 
 namespace Titanium.Web.Proxy.Http2
 {
+    /// <summary>
+    /// Core helper for HTTP/2 protocol handling. 
+    /// Manages connection-level state, frame relaying, and hop-local control frame processing.
+    /// </summary>
     internal class Http2Helper
     {
+        /// <summary>
+        /// The fixed connection preface that must be sent by both endpoints (RFC 7540 Section 3.5).
+        /// </summary>
         public static readonly byte[] ConnectionPreface = Encoding.ASCII.GetBytes("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
 
         /// <summary>
-        ///     Relays the input clientStream to the server at the specified host name and port with the given httpCmd and headers
-        ///     as prefix. Useful for HTTP/2 tunneling.
-        ///     Task-based Asynchronous Pattern
+        /// Relays the input clientStream to the server at the specified host name and port.
+        /// Useful for HTTP/2 tunneling.
         /// </summary>
         internal static async Task SendHttp2(Stream clientStream, Stream serverStream,
             Func<SessionEventArgs> sessionFactory,
@@ -40,16 +46,27 @@ namespace Titanium.Web.Proxy.Http2
             var serverSettings = new Http2Settings();
 
             var sessions = new ConcurrentDictionary<int, SessionEventArgs>();
+            var clientWriteLock = new SemaphoreSlim(1, 1);
+            var serverWriteLock = new SemaphoreSlim(1, 1);
+            var clientFrameHeaderBuffer = new byte[9];
+            var serverFrameHeaderBuffer = new byte[9];
+
+            // HTTP/2 control frames are hop-local. The proxy establishes its own
+            // SETTINGS state with both peers instead of relaying connection prefaces.
+            await WithWriteLockAsync(clientWriteLock,
+                () => Http2FrameWriter.SendSettingsAsync(clientStream, clientFrameHeaderBuffer, cancellationTokenSource.Token));
+            await WithWriteLockAsync(serverWriteLock,
+                () => Http2FrameWriter.SendSettingsAsync(serverStream, serverFrameHeaderBuffer, cancellationTokenSource.Token));
 
             // Now async relay all server=>client & client=>server data
             var sendRelay =
                 CopyHttp2FrameAsync(clientStream, serverStream, clientSettings, serverSettings,
                     sessionFactory, sessions, onBeforeRequest,
-                    connectionId, true, cancellationTokenSource.Token, exceptionFunc);
+                    clientWriteLock, serverWriteLock, connectionId, true, cancellationTokenSource.Token, exceptionFunc);
             var receiveRelay =
                 CopyHttp2FrameAsync(serverStream, clientStream, serverSettings, clientSettings,
                     sessionFactory, sessions, onBeforeResponse,
-                    connectionId, false, cancellationTokenSource.Token, exceptionFunc);
+                    serverWriteLock, clientWriteLock, connectionId, false, cancellationTokenSource.Token, exceptionFunc);
 
             await Task.WhenAny(sendRelay, receiveRelay);
             cancellationTokenSource.Cancel();
@@ -58,9 +75,10 @@ namespace Titanium.Web.Proxy.Http2
         }
 
         private static async Task CopyHttp2FrameAsync(Stream input, Stream output,
-            Http2Settings localSettings, Http2Settings remoteSettings,
+            Http2Settings inputPeerSettings, Http2Settings outputPeerSettings,
             Func<SessionEventArgs> sessionFactory, ConcurrentDictionary<int, SessionEventArgs> sessions,
             Func<SessionEventArgs, Task> onBeforeRequestResponse,
+            SemaphoreSlim inputWriteLock, SemaphoreSlim outputWriteLock,
             Guid connectionId, bool isClient, CancellationToken cancellationToken,
             ExceptionHandler? exceptionFunc)
         {
@@ -110,9 +128,9 @@ namespace Titanium.Web.Proxy.Http2
                 frameHeader.Flags = flags;
                 frameHeader.StreamId = streamId;
 
-                if (buffer == null || buffer.Length < localSettings.MaxFrameSize)
+                if (buffer == null || buffer.Length < inputPeerSettings.MaxFrameSize)
                 {
-                    buffer = new byte[localSettings.MaxFrameSize];
+                    buffer = new byte[inputPeerSettings.MaxFrameSize];
                 }
 
                 read = await Http2FrameReader.ForceReadAsync(input, buffer, 0, length, cancellationToken);
@@ -287,9 +305,9 @@ namespace Titanium.Web.Proxy.Http2
                         try
                         {
                             // Recreate the decoder when new value is bigger
-                            if (decoder == null || headerTableSize < localSettings.HeaderTableSize)
+                            if (decoder == null || headerTableSize < inputPeerSettings.HeaderTableSize)
                             {
-                                headerTableSize = localSettings.HeaderTableSize;
+                                headerTableSize = inputPeerSettings.HeaderTableSize;
                                 decoder = new Decoder(8192, headerTableSize);
                             }
 
@@ -337,10 +355,12 @@ namespace Titanium.Web.Proxy.Http2
 
                         if (handler == await Task.WhenAny(tcs.Task, handler))
                         {
-                            rr.ReadHttp2BeforeHandlerTaskCompletionSource = null;
-                            tcs.SetResult(true);
-                            await Http2FrameWriter.SendHeadersAsync(remoteSettings, encoderState, frameHeader, frameHeaderBuffer, rr, endStream, output, args!.IsPromise, cancellationToken);
-                        }
+                                rr.ReadHttp2BeforeHandlerTaskCompletionSource = null;
+                                tcs.SetResult(true);
+                                await WithWriteLockAsync(outputWriteLock,
+                                    () => Http2FrameWriter.SendHeadersAsync(
+                                        outputPeerSettings, encoderState, frameHeader, frameHeaderBuffer, rr, endStream, output, args!.IsPromise, cancellationToken));
+                            }
                         else
                         {
                             rr.Http2IgnoreBodyFrames = true;
@@ -390,9 +410,9 @@ namespace Titanium.Web.Proxy.Http2
                                 });
                             try
                             {
-                                if (decoder == null || headerTableSize < localSettings.HeaderTableSize)
+                                if (decoder == null || headerTableSize < inputPeerSettings.HeaderTableSize)
                                 {
-                                    headerTableSize = localSettings.HeaderTableSize;
+                                    headerTableSize = inputPeerSettings.HeaderTableSize;
                                     decoder = new Decoder(8192, headerTableSize);
                                 }
 
@@ -437,7 +457,9 @@ namespace Titanium.Web.Proxy.Http2
                             {
                                 rr.ReadHttp2BeforeHandlerTaskCompletionSource = null;
                                 tcs.SetResult(true);
-                                await Http2FrameWriter.SendHeadersAsync(remoteSettings, encoderState, frameHeader, frameHeaderBuffer, rr, false, output, args.IsPromise, cancellationToken);
+                                await WithWriteLockAsync(outputWriteLock,
+                                    () => Http2FrameWriter.SendHeadersAsync(
+                                        outputPeerSettings, encoderState, frameHeader, frameHeaderBuffer, rr, false, output, args.IsPromise, cancellationToken));
                             }
                             else
                             {
@@ -453,7 +475,7 @@ namespace Titanium.Web.Proxy.Http2
                 // ==================== SETTINGS frame ====================
                 else if (type == Http2FrameType.Settings)
                 {
-                    // Fix Critical: Send SETTINGS ACK (RFC 7540 §6.5)
+                    // SETTINGS are hop-local. Apply them to this peer state and ACK locally.
                     bool isAck = (flags & Http2FrameFlag.Ack) != 0;
 
                     if (!isAck)
@@ -474,18 +496,18 @@ namespace Titanium.Web.Proxy.Http2
                             switch (identifier)
                             {
                                 case 1: // SETTINGS_HEADER_TABLE_SIZE
-                                    remoteSettings.HeaderTableSize = value;
+                                    inputPeerSettings.HeaderTableSize = value;
                                     break;
                                 case 2: // SETTINGS_ENABLE_PUSH
-                                    remoteSettings.EnablePush = value;
+                                    inputPeerSettings.EnablePush = value;
                                     break;
                                 case 3: // SETTINGS_MAX_CONCURRENT_STREAMS
-                                    remoteSettings.MaxConcurrentStreams = value < 0 ? int.MaxValue : value;
+                                    inputPeerSettings.MaxConcurrentStreams = value < 0 ? int.MaxValue : value;
                                     break;
                                 case 4: // SETTINGS_INITIAL_WINDOW_SIZE
                                     // RFC 7540 §6.9.2: update existing stream windows when INITIAL_WINDOW_SIZE changes
-                                    int delta = value - remoteSettings.InitialWindowSize;
-                                    remoteSettings.InitialWindowSize = value;
+                                    int delta = value - inputPeerSettings.InitialWindowSize;
+                                    inputPeerSettings.InitialWindowSize = value;
                                     // Update all open stream windows
                                     foreach (var key in streamWindowSizes.Keys)
                                     {
@@ -493,19 +515,19 @@ namespace Titanium.Web.Proxy.Http2
                                     }
                                     break;
                                 case 5: // SETTINGS_MAX_FRAME_SIZE
-                                    remoteSettings.MaxFrameSize = value;
+                                    inputPeerSettings.MaxFrameSize = value;
                                     break;
                                 case 6: // SETTINGS_MAX_HEADER_LIST_SIZE
-                                    remoteSettings.MaxHeaderListSize = value < 0 ? int.MaxValue : value;
+                                    inputPeerSettings.MaxHeaderListSize = value < 0 ? int.MaxValue : value;
                                     break;
                             }
                         }
 
                         // Send SETTINGS ACK back (RFC 7540 §6.5)
-                        await Http2FrameWriter.SendSettingsAckAsync(output, frameHeaderBuffer, cancellationToken);
+                        await WithWriteLockAsync(inputWriteLock,
+                            () => Http2FrameWriter.SendSettingsAckAsync(input, frameHeaderBuffer, cancellationToken));
                     }
-                    // Whether ACK or not, forward the original frame to the other side
-                    // (we just also sent our own ACK to the sender)
+                    sendPacket = false;
                 }
                 // ==================== PING frame ====================
                 // Fix High: Reply to PING frames (RFC 7540 §6.7)
@@ -516,10 +538,13 @@ namespace Titanium.Web.Proxy.Http2
                     if (!isAck && streamId == 0)
                     {
                         // Reply with PING + ACK flag, same 8-byte payload
-                        await Http2FrameWriter.SendPingAckAsync(output, frameHeaderBuffer, buffer[..8], cancellationToken);
+                        var pingPayload = new byte[8];
+                        Array.Copy(buffer, pingPayload, Math.Min(8, length));
+                        await WithWriteLockAsync(inputWriteLock,
+                            () => Http2FrameWriter.SendPingAckAsync(input, frameHeaderBuffer, pingPayload, cancellationToken));
                         sendPacket = false;
                     }
-                    // If it's already an ACK, forward it (it's a response to a PING we sent)
+                    sendPacket = false;
                 }
                 // ==================== WINDOW_UPDATE frame ====================
                 // Fix High: Handle flow control (RFC 7540 §6.9)
@@ -532,17 +557,17 @@ namespace Titanium.Web.Proxy.Http2
                         if (streamId == 0)
                         {
                             // Connection-level window update
-                            remoteSettings.ConnectionWindowSize += increment;
+                            inputPeerSettings.ConnectionWindowSize += increment;
                         }
                         else
                         {
                             // Stream-level window update
                             if (!streamWindowSizes.TryGetValue(streamId, out int current))
-                                current = remoteSettings.InitialWindowSize;
+                                current = inputPeerSettings.InitialWindowSize;
                             streamWindowSizes[streamId] = current + increment;
                         }
                     }
-                    // Forward the WINDOW_UPDATE to the other side as normal
+                    sendPacket = false;
                 }
                 // ==================== RST_STREAM frame ====================
                 else if (type == Http2FrameType.RstStream)
@@ -618,7 +643,9 @@ namespace Titanium.Web.Proxy.Http2
                         Breakpoint();
                     }
 
-                    await Http2FrameWriter.SendBodyAsync(remoteSettings, encoderState, rr, frameHeader, frameHeaderBuffer, buffer, output, cancellationToken);
+                    await WithWriteLockAsync(outputWriteLock,
+                        () => Http2FrameWriter.SendBodyAsync(
+                            outputPeerSettings, encoderState, rr, frameHeader, frameHeaderBuffer, buffer, output, cancellationToken));
                 }
 
                 if (!isClient && endStream)
@@ -630,10 +657,12 @@ namespace Titanium.Web.Proxy.Http2
 
                 if (sendPacket)
                 {
-                    // Do not cancel the write operation
-                    frameHeader.CopyToBuffer(frameHeaderBuffer);
-                    await output.WriteAsync(frameHeaderBuffer, 0, frameHeaderBuffer.Length);
-                    await output.WriteAsync(buffer, 0, length);
+                    await WithWriteLockAsync(outputWriteLock, async () =>
+                    {
+                        frameHeader.CopyToBuffer(frameHeaderBuffer);
+                        await output.WriteAsync(frameHeaderBuffer, 0, frameHeaderBuffer.Length);
+                        await output.WriteAsync(buffer, 0, length);
+                    });
                 }
 
                 // Fix Critical 2: After writing DATA out, send WINDOW_UPDATE back to source
@@ -642,7 +671,8 @@ namespace Titanium.Web.Proxy.Http2
                 if (type == Http2FrameType.Data && localConnConsumed >= WindowUpdateThreshold)
                 {
                     // Connection-level WINDOW_UPDATE (stream id = 0)
-                    await Http2FrameWriter.SendWindowUpdateAsync(input, frameHeaderBuffer, 0, localConnConsumed, cancellationToken);
+                    await WithWriteLockAsync(inputWriteLock,
+                        () => Http2FrameWriter.SendWindowUpdateAsync(input, frameHeaderBuffer, 0, localConnConsumed, cancellationToken));
                     localConnConsumed = 0;
                 }
 
@@ -651,7 +681,8 @@ namespace Titanium.Web.Proxy.Http2
                     localStreamConsumed.TryGetValue(streamId, out int toAckStream) &&
                     toAckStream >= WindowUpdateThreshold)
                 {
-                    await Http2FrameWriter.SendWindowUpdateAsync(input, frameHeaderBuffer, streamId, toAckStream, cancellationToken);
+                    await WithWriteLockAsync(inputWriteLock,
+                        () => Http2FrameWriter.SendWindowUpdateAsync(input, frameHeaderBuffer, streamId, toAckStream, cancellationToken));
                     localStreamConsumed[streamId] = 0;
                 }
 
@@ -667,6 +698,19 @@ namespace Titanium.Web.Proxy.Http2
         {
             // When this method is called something received which is not yet implemented
             ;
+        }
+
+        private static async Task WithWriteLockAsync(SemaphoreSlim writeLock, Func<Task> writeFunc)
+        {
+            await writeLock.WaitAsync();
+            try
+            {
+                await writeFunc();
+            }
+            finally
+            {
+                writeLock.Release();
+            }
         }
 
         class MyHeaderListener : IHeaderListener

@@ -139,35 +139,6 @@ namespace Titanium.Web.Proxy
 
                         clientStream.Connection.SslProtocol = sslProtocol;
 
-                        var http2Supported = false;
-
-                        if (EnableHttp2)
-                        {
-                            var alpn = clientHelloInfo.GetAlpn();
-                            if (alpn != null && alpn.Contains(SslApplicationProtocol.Http2))
-                                // test server HTTP/2 support
-                                try
-                                {
-                                    // todo: this is a hack, because Titanium does not support HTTP protocol changing currently
-                                    var connection = await TcpConnectionFactory.GetServerConnection(this, connectArgs,
-                                        true, SslExtensions.Http2ProtocolAsList,
-                                        true, true, cancellationToken);
-
-                                    if (connection != null)
-                                    {
-                                        http2Supported = connection.NegotiatedApplicationProtocol ==
-                                                         SslApplicationProtocol.Http2;
-
-                                        // release connection back to pool instead of closing when connection pool is enabled.
-                                        await TcpConnectionFactory.Release(connection, true);
-                                    }
-                                }
-                                catch (Exception)
-                                {
-                                    // ignore
-                                }
-                        }
-
                         if (EnableTcpServerConnectionPrefetch)
                             // don't pass cancellation token here
                             // it could cause floating server connections when client exits
@@ -192,8 +163,12 @@ namespace Titanium.Web.Proxy
 
                             // Successfully managed to authenticate the client using the fake certificate
                             var options = new SslServerAuthenticationOptions();
-                            if (EnableHttp2 && http2Supported)
+                            if (EnableHttp2)
                             {
+                                // Negotiate with the client based on what the client offered.
+                                // The server hop is decided later:
+                                // - H2 server => relay
+                                // - H1 server => translate H2 client to H1 server
                                 options.ApplicationProtocols = clientHelloInfo.GetAlpn();
                                 if (options.ApplicationProtocols == null || options.ApplicationProtocols.Count == 0)
                                     options.ApplicationProtocols = SslExtensions.Http11ProtocolAsList;
@@ -325,20 +300,19 @@ namespace Titanium.Web.Proxy
                             throw new Exception($"HTTP/2 Protocol violation. Empty string expected, '{line}' received");
 
                         var connection = (await TcpConnectionFactory.GetServerConnection(this, connectArgs,
-                            true, SslExtensions.Http2ProtocolAsList,
+                            true, SslExtensions.Http2AndHttp11Protocols,
                             true, false, cancellationToken))!;
                         try
                         {
 #if NET6_0_OR_GREATER
-                            var connectionPreface = new ReadOnlyMemory<byte>(Http2Helper.ConnectionPreface);
-                            await connection.Stream.WriteAsync(connectionPreface, cancellationToken);
-
                             // Check whether server actually negotiated H2
                             var serverSpeaksH2 = connection.NegotiatedApplicationProtocol ==
                                                  SslApplicationProtocol.Http2;
 
                             if (serverSpeaksH2)
                             {
+                                var connectionPreface = new ReadOnlyMemory<byte>(Http2Helper.ConnectionPreface);
+                                await connection.Stream.WriteAsync(connectionPreface, cancellationToken);
                                 // H2↔H2 tunnel — existing path unchanged
                                 await Http2Helper.SendHttp2(clientStream, connection.Stream,
                                     () => new SessionEventArgs(this, endPoint, clientStream, connectArgs?.HttpClient.ConnectRequest, cancellationTokenSource)

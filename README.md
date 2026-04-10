@@ -6,7 +6,7 @@ A lightweight HTTP(S) proxy server written in C#.
 
 Report bugs or raise issues here. For programming help use [StackOverflow](http://stackoverflow.com/questions/tagged/titanium-web-proxy) with the tag Titanium-Web-Proxy.
 
-* [API Documentation](https://justcoding121.github.io/titanium-web-proxy/docs/api/Titanium.Web.Proxy.ProxyServer.html)
+* [API Documentation](https://laipg91.github.io/titanium-web-proxy/docs/api/Titanium.Web.Proxy.ProxyServer.html)
 * [Wiki & Contribution guidelines](https://github.com/laipg91/Titanium-Web-Proxy/wiki)
 
 ### Features
@@ -16,13 +16,13 @@ Report bugs or raise issues here. For programming help use [StackOverflow](http:
 * Supports mutual SSL authentication, proxy authentication & automatic upstream proxy detection
 * Supports kerberos, NTLM authentication over HTTP protocols on windows domain controlled networks
 * SOCKS4/5 Proxy support
-* HTTP/2 support but not tested (Only for .Net 6.0 or above)
+* HTTP/2 support but not tested in production environment (Only for .Net 6.0 or above)
 * SOCKS5 with UDP Associate
 
 
 Supports
 
- * .NET Framework 4.5 or above
+ * .NET Framework 4.6 or above
 
 ###  Note to contributors
  * The original project now archived, this is the fork and maintained by laipg91
@@ -36,10 +36,9 @@ Supports
 
 #### Collaborators
 
-The owner of this project, [justcoding121](https://github.com/justcoding121), is considered to be inactive from this project due to his busy work schedule. However, we have a collaborator listed below who time and again shows up to maintain this project. Please create pull requests prioritizing bug fixes for the attention of collaborators.
+The owner of this project, [justcoding121](https://github.com/justcoding121) archived his repo, then I decided to fork and continue maintance it.
 
-* [honfika](https://github.com/honfika)
- 
+
 ### Development environment
 
 #### Windows

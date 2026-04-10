@@ -1,4 +1,4 @@
-﻿/*
+/*
  * Copyright 2014 Twitter, Inc
  * This file is a derivative work modified by Ringo Leese
  *
@@ -22,6 +22,9 @@ using Titanium.Web.Proxy.Models;
 namespace Titanium.Web.Proxy.Http2.Hpack
 {
 
+    /// <summary>
+    /// HPACK decoder as defined in RFC 7541.
+    /// </summary>
     internal class Decoder
     {
         private readonly DynamicTable dynamicTable;

@@ -34,6 +34,9 @@ namespace Titanium.Web.Proxy.Http2.Translation
     /// </summary>
     internal sealed class Http1ToHttp2Translator : IHttp2Translator
     {
+        /// <summary>
+        /// Runs the translation loop for an HTTP/1.x client and an HTTP/2 server.
+        /// </summary>
         public async Task TranslateAsync(
             HttpClientStream clientStream,
             Stream serverStream,
@@ -54,6 +57,9 @@ namespace Titanium.Web.Proxy.Http2.Translation
 
             // H2 stream IDs sent by proxy→server start at 1 and increment by 2 (client-initiated)
             int nextStreamId = 1;
+
+            await serverStream.WriteAsync(Http2Helper.ConnectionPreface, 0, Http2Helper.ConnectionPreface.Length, ct);
+            await Http2FrameWriter.SendSettingsAsync(serverStream, frameHeaderBuf, ct);
 
             // Wait for server's connection preface (SETTINGS frame) before sending requests.
             // This also handles any PING frames sent by the server before SETTINGS.
@@ -120,11 +126,12 @@ namespace Titanium.Web.Proxy.Http2.Translation
                 // ── Stream request body as DATA frames ───────────────────────
                 if (request.HasBody)
                     await ForwardBodyAsDataFramesAsync(
-                        clientStream, serverStream, serverSettings,
+                        clientStream, serverStream,
                         frameHeader, frameHeaderBuf, dataBuffer, request, streamId, ct);
 
                 // ── Read H2 response from server ─────────────────────────────
                 var response = args.HttpClient.Response;
+                response.RequestMethod = request.Method;
                 await ReadH2ResponseAsync(
                     serverStream, serverSettings, encoderState,
                     frameHeader, frameHeaderBuf, dataBuffer,
@@ -145,6 +152,9 @@ namespace Titanium.Web.Proxy.Http2.Translation
 
         // ── Server preface consumer ───────────────────────────────────────────
 
+        /// <summary>
+        /// Consumes the server's connection preface (mandatory SETTINGS frame).
+        /// </summary>
         private static async Task ConsumeServerPrefaceAsync(
             Stream serverStream, Http2Settings serverSettings,
             Http2FrameHeader frameHeader, byte[] headerBuffer, byte[] dataBuffer,
@@ -183,6 +193,9 @@ namespace Titanium.Web.Proxy.Http2.Translation
 
         // ── Send H2 request HEADERS ───────────────────────────────────────────
 
+        /// <summary>
+        /// Encodes and sends HTTP/2 request headers to the server.
+        /// </summary>
         private static async Task SendH2RequestHeadersAsync(
             Stream serverStream, Http2Settings serverSettings, Http2EncoderState encoderState,
             Http2FrameHeader frameHeader, byte[] headerBuffer,
@@ -220,38 +233,110 @@ namespace Titanium.Web.Proxy.Http2.Translation
 
         // ── Forward request body as DATA frames ───────────────────────────────
 
+        /// <summary>
+        /// Forwards the HTTP/1.x request body to the server as a series of HTTP/2 DATA frames.
+        /// </summary>
         private static async Task ForwardBodyAsDataFramesAsync(
-            Stream clientStream, Stream serverStream, Http2Settings serverSettings,
+            HttpClientStream clientStream, Stream serverStream,
             Http2FrameHeader frameHeader, byte[] headerBuffer, byte[] dataBuffer,
             Request request, int streamId, CancellationToken ct)
         {
-            long remaining = request.ContentLength;
-            bool isChunked = request.IsChunked;
-
-            while (true)
+            if (request.IsChunked)
             {
-                int toRead = Math.Min(dataBuffer.Length, remaining > 0 ? (int)remaining : dataBuffer.Length);
-                int read   = await clientStream.ReadAsync(dataBuffer, 0, toRead, ct);
-                if (read == 0) break;
+                await ForwardChunkedBodyAsDataFramesAsync(
+                    clientStream, serverStream, frameHeader, headerBuffer, dataBuffer, streamId, ct);
+                return;
+            }
+
+            long remaining = request.ContentLength;
+            while (remaining > 0)
+            {
+                int toRead = Math.Min(dataBuffer.Length, (int)Math.Min(remaining, int.MaxValue));
+                int read = await clientStream.ReadAsync(dataBuffer, 0, toRead, ct);
+                if (read == 0)
+                    throw new IOException("Unexpected end of HTTP/1.x request body.");
 
                 remaining -= read;
-                bool lastFrame = !isChunked && remaining <= 0;
-
-                frameHeader.Length   = read;
-                frameHeader.Type     = Http2FrameType.Data;
-                frameHeader.Flags    = lastFrame ? Http2FrameFlag.EndStream : (Http2FrameFlag)0;
-                frameHeader.StreamId = streamId;
-                frameHeader.CopyToBuffer(headerBuffer);
-
-                await serverStream.WriteAsync(headerBuffer, 0, 9,    ct);
-                await serverStream.WriteAsync(dataBuffer,   0, read, ct);
-
-                if (lastFrame) break;
+                await SendDataFrameAsync(
+                    serverStream, frameHeader, headerBuffer, dataBuffer, read, streamId, remaining == 0, ct);
             }
+        }
+
+        private static async Task ForwardChunkedBodyAsDataFramesAsync(
+            HttpClientStream clientStream, Stream serverStream,
+            Http2FrameHeader frameHeader, byte[] headerBuffer, byte[] dataBuffer,
+            int streamId, CancellationToken ct)
+        {
+            while (true)
+            {
+                var chunkHead = await clientStream.ReadLineAsync(ct);
+                if (chunkHead == null)
+                    throw new IOException("Unexpected end of chunked request body.");
+
+                int separatorIndex = chunkHead.IndexOf(';');
+                if (separatorIndex >= 0)
+                    chunkHead = chunkHead.Substring(0, separatorIndex);
+
+                if (!int.TryParse(chunkHead, System.Globalization.NumberStyles.HexNumber, null, out int chunkSize))
+                    throw new ProxyHttpException($"Invalid chunk length: '{chunkHead}'", null, null);
+
+                if (chunkSize == 0)
+                {
+                    await ConsumeChunkTrailersAsync(clientStream, ct);
+                    await SendDataFrameAsync(
+                        serverStream, frameHeader, headerBuffer, dataBuffer, 0, streamId, true, ct);
+                    return;
+                }
+
+                int remaining = chunkSize;
+                while (remaining > 0)
+                {
+                    int toRead = Math.Min(dataBuffer.Length, remaining);
+                    int read = await clientStream.ReadAsync(dataBuffer, 0, toRead, ct);
+                    if (read == 0)
+                        throw new IOException("Unexpected end of chunked request data.");
+
+                    remaining -= read;
+                    await SendDataFrameAsync(
+                        serverStream, frameHeader, headerBuffer, dataBuffer, read, streamId, false, ct);
+                }
+
+                var chunkTerminator = await clientStream.ReadLineAsync(ct);
+                if (chunkTerminator == null)
+                    throw new IOException("Unexpected end of chunked request terminator.");
+            }
+        }
+
+        private static async Task ConsumeChunkTrailersAsync(HttpClientStream clientStream, CancellationToken ct)
+        {
+            while (true)
+            {
+                var trailerLine = await clientStream.ReadLineAsync(ct);
+                if (trailerLine == null || trailerLine.Length == 0)
+                    return;
+            }
+        }
+
+        private static async Task SendDataFrameAsync(
+            Stream serverStream, Http2FrameHeader frameHeader, byte[] headerBuffer, byte[] dataBuffer,
+            int payloadLength, int streamId, bool endStream, CancellationToken ct)
+        {
+            frameHeader.Length = payloadLength;
+            frameHeader.Type = Http2FrameType.Data;
+            frameHeader.Flags = endStream ? Http2FrameFlag.EndStream : (Http2FrameFlag)0;
+            frameHeader.StreamId = streamId;
+            frameHeader.CopyToBuffer(headerBuffer);
+
+            await serverStream.WriteAsync(headerBuffer, 0, 9, ct);
+            if (payloadLength > 0)
+                await serverStream.WriteAsync(dataBuffer, 0, payloadLength, ct);
         }
 
         // ── Read H2 response from server ──────────────────────────────────────
 
+        /// <summary>
+        /// Reads the HTTP/2 response from the server and populates the <see cref="Response"/> object.
+        /// </summary>
         private static async Task ReadH2ResponseAsync(
             Stream serverStream, Http2Settings serverSettings, Http2EncoderState encoderState,
             Http2FrameHeader frameHeader, byte[] headerBuffer, byte[] dataBuffer,
@@ -326,6 +411,7 @@ namespace Titanium.Web.Proxy.Http2.Translation
                     }
 
                     Http2HeaderConverter.ApplyToHttp1Response(response, headers);
+                    response.SetOriginalHeaders();
 
                     if ((flags & Http2FrameFlag.EndStream) != 0) break;
                 }
@@ -353,22 +439,17 @@ namespace Titanium.Web.Proxy.Http2.Translation
 
         // ── Write HTTP/1.x response to client ────────────────────────────────
 
-        private static async Task WriteH1ResponseAsync(Stream clientStream, Response response, CancellationToken ct)
+        private static async Task WriteH1ResponseAsync(HttpClientStream clientStream, Response response, CancellationToken ct)
         {
-            var hb = new HeaderBuilder();
-            hb.WriteResponseLine(HttpHeader.Version11, response.StatusCode, response.StatusDescription);
-            hb.WriteHeaders(response.Headers);
-            var buf = hb.GetBuffer();
-            await clientStream.WriteAsync(buf.Array!, buf.Offset, buf.Count, ct);
-
-            if (response.IsBodyRead && response.Body?.Length > 0)
-                await clientStream.WriteAsync(response.Body, 0, response.Body.Length, ct);
-
-            await clientStream.FlushAsync(ct);
+            response.HttpVersion = HttpHeader.Version11;
+            await clientStream.WriteResponseAsync(response, ct);
         }
 
         // ── SETTINGS parser (shared) ────────────────────────────────────────────────
 
+        /// <summary>
+        /// Parses an HTTP/2 SETTINGS frame payload.
+        /// </summary>
         internal static void ParseSettings(Http2Settings settings, byte[] buffer, int length)
         {
             if (length % 6 != 0) return;

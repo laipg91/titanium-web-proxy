@@ -1,4 +1,4 @@
-﻿/*
+/*
  * Copyright 2014 Twitter, Inc
  * This file is a derivative work modified by Ringo Leese
  *
@@ -21,6 +21,9 @@ using Titanium.Web.Proxy.Models;
 namespace Titanium.Web.Proxy.Http2.Hpack
 {
 
+    /// <summary>
+    /// Represents an HPACK dynamic table used for header compression (RFC 7541 Section 2.3.2).
+    /// </summary>
     public class DynamicTable
     {
         // a circular queue of header fields
