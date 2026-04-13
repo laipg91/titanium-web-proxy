@@ -20,6 +20,10 @@ namespace Titanium.Web.Proxy
         // Atomic counter for active UDP relay sessions.
         private int udpAssociateSessionCount;
 
+        // Shared DNS cache for all UDP sessions to reduce redundant resolution
+        private readonly ConcurrentDictionary<string, DnsCacheEntry> udpDnsCache = new ConcurrentDictionary<string, DnsCacheEntry>();
+        private long lastUdpDnsCacheCleanupTicks = DateTime.UtcNow.Ticks;
+
         /// <summary>
         /// Handles the SOCKS5 UDP ASSOCIATE command.
         /// Entry point called from SocksClientHandler when CMD=0x03 is received.
@@ -104,6 +108,7 @@ namespace Titanium.Web.Proxy
                             endPoint.EnableUdpSsrfFilter,
                             relayAwaitable,
                             remoteAwaitable,
+                            this,
                             relayCts.Token),
                         MonitorUdpTcpLifetime(tcpStream, relayCts),
                         WatchIdleTimeout(idleTimeout, relaySession, relayCts));
@@ -159,6 +164,7 @@ namespace Titanium.Web.Proxy
             bool enableSsrfFilter,
             UdpSocketAwaitable relayAwaitable,
             UdpSocketAwaitable remoteAwaitable,
+            ProxyServer proxyServer,
             CancellationToken ct)
         {
             var loopA = LoopClientToRemote(
@@ -170,6 +176,7 @@ namespace Titanium.Web.Proxy
                 enableSsrfFilter,
                 relayAwaitable,
                 remoteAwaitable,
+                proxyServer,
                 ct);
 
             var loopB = LoopRemoteToClient(
@@ -197,10 +204,11 @@ namespace Titanium.Web.Proxy
             bool enableSsrfFilter,
             UdpSocketAwaitable recvAwaitable,
             UdpSocketAwaitable sendAwaitable,
+            ProxyServer proxyServer,
             CancellationToken ct)
         {
-            var dnsCache = new ConcurrentDictionary<string, DnsCacheEntry>();
             var dnsCacheTtlTicks = TimeSpan.FromMinutes(5).Ticks;
+            var dnsCache = proxyServer.udpDnsCache;
 
             while (!ct.IsCancellationRequested)
             {
@@ -243,6 +251,8 @@ namespace Titanium.Web.Proxy
                                 dnsCache[dnsCacheKey] = new DnsCacheEntry(
                                     resolved,
                                     DateTime.UtcNow.Ticks + dnsCacheTtlTicks);
+
+                                proxyServer.CleanupUdpDnsCacheIfNeeded();
                             }
                             catch
                             {
@@ -283,6 +293,33 @@ namespace Titanium.Web.Proxy
         private static string GetDnsCacheKey(string domainName, AddressFamily addressFamily)
         {
             return domainName + "|" + (int)addressFamily;
+        }
+
+        /// <summary>
+        /// Cleans up expired entries from the UDP DNS cache to prevent memory leaks/buffer overflows.
+        /// </summary>
+        private void CleanupUdpDnsCacheIfNeeded()
+        {
+            var nowTicks = DateTime.UtcNow.Ticks;
+            var lastCleanup = Interlocked.Read(ref lastUdpDnsCacheCleanupTicks);
+            
+            // Run cleanup at most once every 5 minutes
+            if (nowTicks - lastCleanup > TimeSpan.FromMinutes(5).Ticks)
+            {
+                if (Interlocked.CompareExchange(ref lastUdpDnsCacheCleanupTicks, nowTicks, lastCleanup) == lastCleanup)
+                {
+                    Task.Run(() =>
+                    {
+                        foreach (var kvp in udpDnsCache)
+                        {
+                            if (nowTicks > kvp.Value.ExpiryTicks)
+                            {
+                                udpDnsCache.TryRemove(kvp.Key, out _);
+                            }
+                        }
+                    });
+                }
+            }
         }
 
         private static IPAddress? SelectBestResolvedAddress(IPAddress[] addresses, AddressFamily addressFamily)
