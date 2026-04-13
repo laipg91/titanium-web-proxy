@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Net;
 using System.Net.Http;
@@ -166,6 +166,8 @@ public class NestedProxyTests
         var rnd = new Random();
 
         var proxies2 = new List<ProxyServer>();
+        using var testSuite = new TestSuite();
+        var server = testSuite.GetServer();
 
         //create a level 2 upstream proxy farm that forwards to server
         for (var i = 0; i < 10; i++)

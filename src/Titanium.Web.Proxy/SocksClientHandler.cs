@@ -76,13 +76,17 @@ namespace Titanium.Web.Proxy
                     
                     if (ProxyAuthenticationSchemes.Contains("IP-Address") && ProxySchemeAuthenticateFunc != null)
                     {
-                        //Socks4 doesnt support authentication, so if set authentication we can verify by IP if needed
                         var authResult = await ProxySchemeAuthenticateFunc.Invoke(sessionEventArgs, "IP-Address", string.Empty);
                         if (authResult.Result != ProxyAuthenticationResult.Success)
                         {
-                            buffer[1] = 91;//request rejected or failed
+                            // SOCKS4 cannot do basic auth, so ContinuationNeeded is also a reject
+                            buffer[1] = 91; //request rejected or failed
                         }
-
+                    }
+                    else if (ProxyBasicAuthenticateFunc != null)
+                    {
+                        // Basic auth is required but SOCKS4 has no way to provide credentials → reject
+                        buffer[1] = 91;
                     }
 
                     await stream.WriteAsync(buffer, 0, 8, cancellationToken);
@@ -96,30 +100,55 @@ namespace Titanium.Web.Proxy
                     if (read < authenticationMethodCount) return;
 
                     var acceptedMethod = 255;
+                    bool clientSupportsNoAuth = false;
+                    bool clientSupportsUserPass = false;
+
                     for (var i = 0; i < authenticationMethodCount; i++)
                     {
                         int method = buffer[i + 2];
-                        if (method == 0)
+                        if (method == 0) clientSupportsNoAuth = true;
+                        if (method == 2) clientSupportsUserPass = true;
+                    }
+
+                    // Determine accepted method based on auth configuration
+                    if (clientSupportsNoAuth)
+                    {
+                        bool noAuthAllowed = true;
+
+                        // 1. Check IP-Address scheme first
+                        if (ProxyAuthenticationSchemes.Contains("IP-Address") && ProxySchemeAuthenticateFunc != null)
                         {
-                            bool success = true;
-                            if (ProxyAuthenticationSchemes.Contains("IP-Address") && ProxySchemeAuthenticateFunc != null)
+                            var authResult = await ProxySchemeAuthenticateFunc.Invoke(sessionEventArgs, "IP-Address", string.Empty);
+                            if (authResult.Result == ProxyAuthenticationResult.Success)
                             {
-                                //client send no authentication but we need verify by IP then we need parse an empty username/password
-                                var authResult = await ProxySchemeAuthenticateFunc.Invoke(sessionEventArgs, "IP-Address", string.Empty);
-                                if (authResult.Result != ProxyAuthenticationResult.Success)
-                                    success = false;
-                            }
-                            if(success)
+                                // IP trusted → accept no-auth immediately
                                 acceptedMethod = 0;
-
-                            break;
+                                noAuthAllowed = true;
+                            }
+                            else if (authResult.Result == ProxyAuthenticationResult.ContinuationNeeded)
+                            {
+                                // IP needs further verification → try basic auth if available
+                                noAuthAllowed = false;
+                            }
+                            else // Failure
+                            {
+                                noAuthAllowed = false;
+                            }
                         }
 
-                        if (method == 2)
-                        {
+                        // 2. If no scheme auth configured but basic auth is required, reject no-auth
+                        if (noAuthAllowed && ProxyBasicAuthenticateFunc != null)
+                            noAuthAllowed = false;
+
+                        if (noAuthAllowed)
+                            acceptedMethod = 0;
+                    }
+
+                    // 3. Fall back to username/password if no-auth was not accepted
+                    if (acceptedMethod == 255 && clientSupportsUserPass)
+                    {
+                        if (ProxyBasicAuthenticateFunc != null || ProxySchemeAuthenticateFunc != null)
                             acceptedMethod = 2;
-                            break;
-                        }
                     }
 
                     buffer[1] = (byte)acceptedMethod;
