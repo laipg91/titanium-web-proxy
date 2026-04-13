@@ -31,10 +31,14 @@ namespace Titanium.Web.Proxy
             var port = 0;
             var isUdpAssociate = false;
             SessionEventArgs sessionEventArgs =null;
+
+            // Handshake timeout to prevent infinite wait on laggy/malicious clients
+            cancellationTokenSource.CancelAfter(TimeSpan.FromSeconds(ConnectionTimeOutSeconds));
             try
             {
-                var read = await stream.ReadAsync(buffer, 0, buffer.Length, cancellationToken);
-                if (read < 3) return;
+                // Read at least 2 bytes (VER, NMETHODS/CMD)
+                var read = await ForceReadAsync(stream, buffer, 0, 2, cancellationToken);
+                if (read < 2) return;
 
                 sessionEventArgs = new SessionEventArgs(this, endPoint,
                     new HttpClientStream(this, clientConnection, stream, BufferPool, cancellationToken), null,
@@ -42,11 +46,30 @@ namespace Titanium.Web.Proxy
 
                 if (buffer[0] == 4) //Socks client version 4
                 {
-                    if (read < 9 || buffer[1] != 1)
-                        // not a connect request
+                    if (buffer[1] != 1)
+                        // not a connect request (only CONNECT=0x01 supported in SOCKS4)
                         return;
 
+                    // SOCKS4 CONNECT layout: VER(1) CMD(1) PORT(2) IP(4) USERID(var) NULL(1)
+                    // We already have VER+CMD in buffer[0..1]. Read PORT(2) + IP(4) = 6 bytes.
+                    read = await ForceReadAsync(stream, buffer, 2, 6, cancellationToken);
+                    if (read < 6) return;
+
                     port = (buffer[2] << 8) + buffer[3];
+
+                    // Drain the NULL-terminated USERID field from the stream.
+                    // Without this, leftover bytes corrupt subsequent HTTP traffic.
+                    // Read in chunks using the existing buffer (offset 8+) to find the null terminator.
+                    bool foundNull = false;
+                    while (!foundNull)
+                    {
+                        read = await stream.ReadAsync(buffer, 8, buffer.Length - 8, cancellationToken);
+                        if (read == 0) return; // EOF before null terminator
+                        for (int i = 8; i < 8 + read; i++)
+                        {
+                            if (buffer[i] == 0) { foundNull = true; break; }
+                        }
+                    }
 
                     buffer[0] = 0;
                     buffer[1] = 90; // request granted
@@ -69,7 +92,8 @@ namespace Titanium.Web.Proxy
                 else if (buffer[0] == 5) //Socks client version 5
                 {
                     int authenticationMethodCount = buffer[1];
-                    if (read < authenticationMethodCount + 2) return;
+                    read = await ForceReadAsync(stream, buffer, 2, authenticationMethodCount, cancellationToken);
+                    if (read < authenticationMethodCount) return;
 
                     var acceptedMethod = 255;
                     for (var i = 0; i < authenticationMethodCount; i++)
@@ -107,18 +131,23 @@ namespace Titanium.Web.Proxy
                     
                     if (acceptedMethod == 2)
                     {
-                        read = await stream.ReadAsync(buffer, 0, buffer.Length, cancellationToken);
-                        if (read < 3 || buffer[0] != 1)
+                        // Read Version and Username Length
+                        read = await ForceReadAsync(stream, buffer, 0, 2, cancellationToken);
+                        if (read < 2 || buffer[0] != 1)
                             // authentication version should be 1
                             return;
 
                         int userNameLength = buffer[1];
-                        if (read < 3 + userNameLength) return;
+                        // Read Username + Password Length byte
+                        read = await ForceReadAsync(stream, buffer, 2, userNameLength + 1, cancellationToken);
+                        if (read < userNameLength + 1) return;
 
                         var userName = Encoding.ASCII.GetString(buffer, 2, userNameLength);
 
                         int passwordLength = buffer[2 + userNameLength];
-                        if (read < 3 + userNameLength + passwordLength) return;
+                        // Read Password
+                        read = await ForceReadAsync(stream, buffer, 3 + userNameLength, passwordLength, cancellationToken);
+                        if (read < passwordLength) return;
 
                         var password = Encoding.ASCII.GetString(buffer, 3 + userNameLength, passwordLength);
                         var success = true;
@@ -132,48 +161,47 @@ namespace Titanium.Web.Proxy
                         if (!success) return;
                     }
 
-                    read = await stream.ReadAsync(buffer, 0, buffer.Length, cancellationToken);
+                    // 1. Read Header (VER, CMD, RSV, ATYP)
+                    read = await ForceReadAsync(stream, buffer, 0, 4, cancellationToken);
+                    if (read < 4) return;
                     var cmd = buffer[1];
-                    if (read < 10 || (cmd != 1 && cmd != 3)) return;
+                    if (cmd != 1 && cmd != 3) return;
 
-                    if (cmd == 3) // UDP ASSOCIATE
-                    {
-                        isUdpAssociate = true;
-                        // Reply is sent inside HandleUdpAssociate after relay socket is bound.
-                        // Just break out of the handshake block — buffer is returned in finally.
-                    }
-                    else // CMD = CONNECT (0x01)
-                    {
-                        int portIdx;
+                        int addrLen;
                         switch (buffer[3])
                         {
                             case 1:
-                                // IPv4
-                                portIdx = 8;
+                                // IPv4: 4 bytes IP + 2 bytes Port
+                                addrLen = 6;
                                 break;
                             case 3:
-                                // Domainname
-                                portIdx = buffer[4] + 5;
-
-#if DEBUG
-                                var hostname = new ByteString(buffer.AsMemory(5, buffer[4]));
-                                string hostnameStr = hostname.GetString();
-#endif
+                                // Domain: 1 byte Len + Len bytes Name + 2 bytes Port
+                                read = await ForceReadAsync(stream, buffer, 4, 1, cancellationToken);
+                                if (read < 1) return;
+                                addrLen = buffer[4] + 2;
                                 break;
                             case 4:
-                                // IPv6
-                                portIdx = 20;
+                                // IPv6: 16 bytes IP + 2 bytes Port
+                                addrLen = 18;
                                 break;
                             default:
                                 return;
                         }
 
-                        if (read < portIdx + 2) return;
+                        var offset = buffer[3] == 3 ? 5 : 4;
+                        read = await ForceReadAsync(stream, buffer, offset, addrLen, cancellationToken);
+                        if (read < addrLen) return;
 
-                        port = (buffer[portIdx] << 8) + buffer[portIdx + 1];
-                        buffer[1] = 0; // succeeded
-                        await stream.WriteAsync(buffer, 0, read, cancellationToken);
-                    } // end cmd == 1 block
+                        if (cmd == 3) // UDP ASSOCIATE
+                        {
+                            isUdpAssociate = true;
+                        }
+                        else // CMD = CONNECT (0x01)
+                        {
+                            port = (buffer[offset + addrLen - 2] << 8) + buffer[offset + addrLen - 1];
+                            buffer[1] = 0; // succeeded
+                            await stream.WriteAsync(buffer, 0, offset + addrLen, cancellationToken);
+                        } // end cmd == 1 block
                 }
                 else
                 {
@@ -186,6 +214,9 @@ namespace Titanium.Web.Proxy
                 sessionEventArgs?.Dispose();
             }
 
+            // Handshake successful, reset timeout to let subsequent handlers manage their own lifetimes
+            cancellationTokenSource.CancelAfter(Timeout.Infinite);
+
             if (isUdpAssociate)
             {
                 await HandleUdpAssociate(endPoint, clientConnection, stream, cancellationToken);
@@ -193,6 +224,28 @@ namespace Titanium.Web.Proxy
             }
 
             await HandleClient(endPoint, clientConnection, port, cancellationTokenSource, cancellationToken);
+        }
+
+        /// <summary>
+        /// Reads exactly <paramref name="bytesToRead"/> bytes from <paramref name="input"/>,
+        /// looping until the buffer is full or the stream signals EOF.
+        /// </summary>
+        private static async Task<int> ForceReadAsync(System.IO.Stream input, byte[] buffer, int offset, int bytesToRead,
+            CancellationToken cancellationToken)
+        {
+            int totalRead = 0;
+            while (bytesToRead > 0)
+            {
+                int read = await input.ReadAsync(buffer, offset, bytesToRead, cancellationToken);
+                if (read == 0)
+                    break; // EOF
+
+                totalRead += read;
+                bytesToRead -= read;
+                offset += read;
+            }
+
+            return totalRead;
         }
     }
 }

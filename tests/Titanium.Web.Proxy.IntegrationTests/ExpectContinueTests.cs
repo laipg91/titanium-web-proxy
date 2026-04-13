@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Net;
 using System.Text;
 using System.Threading.Tasks;
@@ -16,7 +16,7 @@ public class ExpectContinueTests
     {
         int dataSentCount = 0;
         int dataReceivedCount = 0;
-        var testSuite = new TestSuite();
+        using var testSuite = new TestSuite();
         var server = testSuite.GetServer();
         var continueServer = new HttpContinueServer
         {
@@ -47,7 +47,7 @@ public class ExpectContinueTests
     [TestMethod]
     public async Task ReverseProxy_GotExpectationFailedResponse()
     {
-        var testSuite = new TestSuite();
+        using var testSuite = new TestSuite();
         var server = testSuite.GetServer();
         var continueServer = new HttpContinueServer { ExpectationResponse = HttpStatusCode.ExpectationFailed };
         server.HandleTcpRequest(continueServer.HandleRequest);
@@ -70,7 +70,7 @@ public class ExpectContinueTests
     [TestMethod]
     public async Task ReverseProxy_GotNotFoundResponse()
     {
-        var testSuite = new TestSuite();
+        using var testSuite = new TestSuite();
         var server = testSuite.GetServer();
         var continueServer = new HttpContinueServer { ExpectationResponse = HttpStatusCode.NotFound };
         server.HandleTcpRequest(continueServer.HandleRequest);
@@ -93,7 +93,7 @@ public class ExpectContinueTests
     [TestMethod]
     public async Task ReverseProxy_BeforeRequestThrows()
     {
-        var testSuite = new TestSuite();
+        using var testSuite = new TestSuite();
         var server = testSuite.GetServer();
         var continueServer = new HttpContinueServer { ExpectationResponse = HttpStatusCode.Continue };
         server.HandleTcpRequest(continueServer.HandleRequest);

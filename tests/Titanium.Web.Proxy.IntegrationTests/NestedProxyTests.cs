@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Net;
 using System.Net.Http;
@@ -15,7 +15,7 @@ public class NestedProxyTests
     [TestMethod]
     public async Task Smoke_Test_Nested_Proxy()
     {
-        var testSuite = new TestSuite();
+        using var testSuite = new TestSuite();
 
         var server = testSuite.GetServer();
         server.HandleRequest(context =>
@@ -40,7 +40,7 @@ public class NestedProxyTests
     [TestMethod]
     public async Task Smoke_Test_Nested_Proxy_UserData()
     {
-        var testSuite = new TestSuite();
+        using var testSuite = new TestSuite();
 
         var server = testSuite.GetServer();
         server.HandleRequest(context =>
@@ -80,8 +80,7 @@ public class NestedProxyTests
     public async Task Nested_Proxy_Farm_Without_Connection_Cache_Should_Not_Hang()
     {
         var rnd = new Random();
-
-        var testSuite = new TestSuite();
+        using var testSuite = new TestSuite();
 
         var server = testSuite.GetServer();
         server.HandleRequest(context =>
@@ -165,14 +164,6 @@ public class NestedProxyTests
     public async Task Nested_Proxy_Farm_With_Connection_Cache_Should_Not_Hang()
     {
         var rnd = new Random();
-
-        var testSuite = new TestSuite();
-
-        var server = testSuite.GetServer();
-        server.HandleRequest(context =>
-        {
-            return context.Response.WriteAsync("I am server. I received your greetings.");
-        });
 
         var proxies2 = new List<ProxyServer>();
 
