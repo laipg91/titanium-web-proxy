@@ -177,6 +177,38 @@ namespace Titanium.Web.Proxy.Http2.Primitives
             await destination.WriteAsync(payload,      0, 4, cancellationToken);
         }
 
+        // ── GOAWAY ────────────────────────────────────────────────────────────       
+
+        /// <summary>
+        /// Writes a GOAWAY frame with the given last processed stream id and error code (RFC 9113 §6.8).
+        /// </summary>
+        internal static async Task SendGoAwayAsync(
+            Stream destination, byte[] headerBuffer,
+            int lastStreamId, uint errorCode,
+            CancellationToken cancellationToken)
+        {
+            var payload = new byte[8];
+            payload[0] = (byte)((lastStreamId >> 24) & 0x7f);
+            payload[1] = (byte)((lastStreamId >> 16) & 0xff);
+            payload[2] = (byte)((lastStreamId >>  8) & 0xff);
+            payload[3] = (byte)( lastStreamId        & 0xff);
+            payload[4] = (byte)(errorCode >> 24);
+            payload[5] = (byte)(errorCode >> 16);
+            payload[6] = (byte)(errorCode >>  8);
+            payload[7] = (byte) errorCode;
+
+            var header = new Http2FrameHeader
+            {
+                Length   = payload.Length,
+                Type     = Http2FrameType.GoAway,
+                Flags    = (Http2FrameFlag)0,
+                StreamId = 0
+            };
+            header.CopyToBuffer(headerBuffer);
+            await destination.WriteAsync(headerBuffer, 0, 9, cancellationToken);
+            await destination.WriteAsync(payload,      0, payload.Length, cancellationToken);
+        }
+
         // ── HEADERS ───────────────────────────────────────────────────────────
 
         /// <summary>

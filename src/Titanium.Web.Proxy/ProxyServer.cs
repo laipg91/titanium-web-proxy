@@ -145,9 +145,8 @@ namespace Titanium.Web.Proxy
         public bool EnableWinAuth { get; set; }
 
         /// <summary>
-        ///     Enable disable HTTP/2 support.
-        ///     Warning: HTTP/2 support is limited in RFC 7540
-        ///     - cannot modify the request/response (e.g header modifications in BeforeRequest/Response events are ignored)
+        ///     Enable disable HTTP/2 support in RFC 7540 and apart of RFC 9113.
+        ///     Warning: HTTP/2 cannot modify the request/response (e.g header modifications in BeforeRequest/Response events are ignored)
         /// </summary>
         public bool EnableHttp2 { get; set; } = false;
 
@@ -164,6 +163,7 @@ namespace Titanium.Web.Proxy
         ///     - H2 client → H2 backend: Native H2 WebSocket tunnel (multiplexed stream)
         ///     
         ///     Default: false (WebSocket over HTTP/2 disabled until explicitly enabled)
+        ///     Warning: Because RFC 8441 has not been fully implemented in this and any browser at now, then WS through HTTP/2 is incomplete and this option for test purpose only
         /// </summary>
         public bool EnableWebSocketOverHttp2 { get; set; } = false;
 

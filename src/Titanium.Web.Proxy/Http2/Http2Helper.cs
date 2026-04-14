@@ -32,6 +32,11 @@ namespace Titanium.Web.Proxy.Http2
         /// </summary>
         public static readonly byte[] ConnectionPreface = Encoding.ASCII.GetBytes("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
 
+        private const int MaxFlowControlWindowSize = int.MaxValue;
+        private const uint ProtocolError = 0x1;
+        private const uint FlowControlError = 0x3;
+        private const uint FrameSizeError = 0x6;
+
         /// <summary>
         /// Relays the input clientStream to the server at the specified host name and port.
         /// Useful for HTTP/2 tunneling.
@@ -122,6 +127,7 @@ namespace Titanium.Web.Proxy.Http2
             const int WindowUpdateThreshold = 32768; // Send WINDOW_UPDATE after consuming ~32 KB
             int localConnConsumed = 0;               // bytes consumed from source at connection level
             var localStreamConsumed = new Dictionary<int, int>(); // per-stream consumed bytes
+            int lastProcessedStreamId = 0;
 
             while (true)
             {
@@ -141,6 +147,10 @@ namespace Titanium.Web.Proxy.Http2
                 frameHeader.Type = type;
                 frameHeader.Flags = flags;
                 frameHeader.StreamId = streamId;
+                if (streamId > lastProcessedStreamId)
+                {
+                    lastProcessedStreamId = streamId;
+                }
 
                 // Ensure buffer can hold the larger of: the negotiated MaxFrameSize and the
                 // actual declared frame length. A peer that sends a frame larger than the
@@ -647,23 +657,79 @@ namespace Titanium.Web.Proxy.Http2
                 }
                 // ==================== WINDOW_UPDATE frame ====================
                 // Fix High: Handle flow control (RFC 7540 §6.9)
+                // RFC 9113 §6.9/§6.9.1 strict boundaries: invalid increments are hop-local
+                // errors, and updated flow-control windows must never exceed 2^31 - 1.
                 else if (type == Http2FrameType.WindowUpdate)
                 {
-                    if (length == 4)
+                    if (length != 4)
                     {
-                        int increment = ((buffer[0] & 0x7f) << 24) + (buffer[1] << 16) + (buffer[2] << 8) + buffer[3];
+                        await WithWriteLockAsync(inputWriteLock,
+                            () => Http2FrameWriter.SendGoAwayAsync(
+                                input, frameHeaderBuffer, lastProcessedStreamId, FrameSizeError, cancellationToken));
+                        exceptionFunc?.Invoke(new ProxyHttpException("Invalid HTTP/2 WINDOW_UPDATE frame length.", null, args));
+                        return;
+                    }
 
+                    int increment = ((buffer[0] & 0x7f) << 24) + (buffer[1] << 16) + (buffer[2] << 8) + buffer[3];
+
+                    if (increment == 0)
+                    {
                         if (streamId == 0)
                         {
-                            // Connection-level window update
-                            inputPeerSettings.ConnectionWindowSize += increment;
+                            await WithWriteLockAsync(inputWriteLock,
+                                () => Http2FrameWriter.SendGoAwayAsync(
+                                    input, frameHeaderBuffer, lastProcessedStreamId, ProtocolError, cancellationToken));
+                            exceptionFunc?.Invoke(new ProxyHttpException(
+                                "Invalid HTTP/2 WINDOW_UPDATE increment 0 on connection.", null, args));
+                            return;
+                        }
+
+                        await WithWriteLockAsync(inputWriteLock,
+                            () => Http2FrameWriter.SendRstStreamAsync(
+                                input, frameHeaderBuffer, streamId, ProtocolError, cancellationToken));
+                        sessions.TryRemove(streamId, out _);
+                        streamWindowSizes.Remove(streamId);
+                        localStreamConsumed.Remove(streamId);
+                        exceptionFunc?.Invoke(new ProxyHttpException(
+                            $"Invalid HTTP/2 WINDOW_UPDATE increment 0 on stream {streamId}.", null, args));
+                    }
+                    else if (streamId == 0)
+                    {
+                        // Connection-level window update
+                        long updatedWindow = (long)inputPeerSettings.ConnectionWindowSize + increment;
+                        if (updatedWindow > MaxFlowControlWindowSize)
+                        {
+                            await WithWriteLockAsync(inputWriteLock,
+                                () => Http2FrameWriter.SendGoAwayAsync(
+                                    input, frameHeaderBuffer, lastProcessedStreamId, FlowControlError, cancellationToken));
+                            exceptionFunc?.Invoke(new ProxyHttpException(
+                                "HTTP/2 connection flow-control window exceeded 2^31 - 1.", null, args));
+                            return;
+                        }
+
+                        inputPeerSettings.ConnectionWindowSize = (int)updatedWindow;
+                    }
+                    else
+                    {
+                        // Stream-level window update
+                        if (!streamWindowSizes.TryGetValue(streamId, out int current))
+                            current = inputPeerSettings.InitialWindowSize;
+
+                        long updatedWindow = (long)current + increment;
+                        if (updatedWindow > MaxFlowControlWindowSize)
+                        {
+                            await WithWriteLockAsync(inputWriteLock,
+                                () => Http2FrameWriter.SendRstStreamAsync(
+                                    input, frameHeaderBuffer, streamId, FlowControlError, cancellationToken));
+                            sessions.TryRemove(streamId, out _);
+                            streamWindowSizes.Remove(streamId);
+                            localStreamConsumed.Remove(streamId);
+                            exceptionFunc?.Invoke(new ProxyHttpException(
+                                $"HTTP/2 stream {streamId} flow-control window exceeded 2^31 - 1.", null, args));
                         }
                         else
                         {
-                            // Stream-level window update
-                            if (!streamWindowSizes.TryGetValue(streamId, out int current))
-                                current = inputPeerSettings.InitialWindowSize;
-                            streamWindowSizes[streamId] = current + increment;
+                            streamWindowSizes[streamId] = (int)updatedWindow;
                         }
                     }
                     sendPacket = false;

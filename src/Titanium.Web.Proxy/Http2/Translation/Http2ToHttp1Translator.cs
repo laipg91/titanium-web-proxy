@@ -67,7 +67,7 @@ namespace Titanium.Web.Proxy.Http2.Translation
             var readTask = ReadLoopAsync(
                 clientStream, clientSettings, new Http2FrameHeader(), new byte[9],
                 sessionFactory, onBeforeRequest, queue.Writer, clientWriteLock,
-                cts, exceptionFunc);
+                cts, exceptionFunc, enableWebSocketOverHttp2);
 
             var writeTask = WriteLoopAsync(
                 serverStream, clientStream, clientSettings, new Http2FrameHeader(), new byte[9],
@@ -91,7 +91,8 @@ namespace Titanium.Web.Proxy.Http2.Translation
             ChannelWriter<Http2StreamContext> writer,
             SemaphoreSlim clientWriteLock,
             CancellationTokenSource cts,
-            ExceptionHandler? exceptionFunc)
+            ExceptionHandler? exceptionFunc,
+            bool enableWebSocketOverHttp2 = false)
         {
             var ct = cts.Token;
             var dataBuffer = new byte[clientSettings.MaxFrameSize];
@@ -184,7 +185,7 @@ namespace Titanium.Web.Proxy.Http2.Translation
                         {
                             await FinalizeHeadersAsync(
                                 streamId, pendingHeaderBlocks, pendingStreams, sessionFactory, onBeforeRequest, writer,
-                                decoderState, clientSettings, ct, exceptionFunc);
+                                decoderState, clientSettings, ct, exceptionFunc, enableWebSocketOverHttp2);
                         }
 
                         continue;
@@ -206,7 +207,7 @@ namespace Titanium.Web.Proxy.Http2.Translation
                         {
                             await FinalizeHeadersAsync(
                                 streamId, pendingHeaderBlocks, pendingStreams, sessionFactory, onBeforeRequest, writer,
-                                decoderState, clientSettings, ct, exceptionFunc);
+                                decoderState, clientSettings, ct, exceptionFunc, enableWebSocketOverHttp2);
                         }
 
                         continue;
@@ -272,7 +273,8 @@ namespace Titanium.Web.Proxy.Http2.Translation
             HeaderDecoderState decoderState,
             Http2Settings clientSettings,
             CancellationToken ct,
-            ExceptionHandler? exceptionFunc)
+            ExceptionHandler? exceptionFunc,
+            bool enableWebSocketOverHttp2 = false)
         {
             var pendingHeader = pendingHeaderBlocks[streamId];
             pendingHeaderBlocks.Remove(streamId);
@@ -295,7 +297,9 @@ namespace Titanium.Web.Proxy.Http2.Translation
                 }
             }
 
-            context.IsWebSocket = context.Args.HttpClient.Request.UpgradeToWebSocket;
+            // Gate on the flag: when disabled, treat as normal HTTP stream so other
+            // requests on the same connection continue unaffected — no exception allocation.
+            context.IsWebSocket = enableWebSocketOverHttp2 && context.Args.HttpClient.Request.UpgradeToWebSocket;
 
             await onBeforeRequest(context.Args);
 

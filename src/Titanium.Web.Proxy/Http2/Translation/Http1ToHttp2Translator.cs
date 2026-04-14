@@ -68,15 +68,6 @@ namespace Titanium.Web.Proxy.Http2.Translation
             await ConsumeServerPrefaceAsync(
                 serverStream, serverSettings, frameHeader, frameHeaderBuf, dataBuffer, ct, exceptionFunc);
 
-            // RFC 8441 negotiation: check if proxy option enabled but server doesn't support
-            if (enableWebSocketOverHttp2 && serverSettings.EnableConnectProtocol == 0)
-            {
-                exceptionFunc?.Invoke(new ProxyHttpException(
-                    "ProxyServer.EnableWebSocketOverHttp2 is true, but upstream H2 server does not advertise ENABLE_CONNECT_PROTOCOL. " +
-                    "WebSocket-over-HTTP/2 cannot be used with this server.",
-                    null, null));
-            }
-
             // ── Bug #1 Fix: if caller already parsed the first request, use it directly ──
             bool firstRequest = true;
 
@@ -125,43 +116,13 @@ namespace Titanium.Web.Proxy.Http2.Translation
                 var request = args.HttpClient.Request;
 
                 // ── WebSocket Intercept (H1 client ↔ H2 server) ──────────────
-                bool isWebSocket = request.UpgradeToWebSocket;
+                // Gate on the flag: when disabled, treat as normal HTTP and let the server
+                // reject naturally — no proxy interference, no exception allocation.
+                bool isWebSocket = request.UpgradeToWebSocket && enableWebSocketOverHttp2;
                 string? wsClientKey = null;
 
                 if (isWebSocket)
                 {
-                    // RFC 8441: extended-CONNECT requires both proxy AND server support
-                    // If proxy has WebSocket-over-H2 disabled, reject
-                    if (!enableWebSocketOverHttp2)
-                    {
-                        exceptionFunc?.Invoke(new ProxyHttpException(
-                            "WebSocket-over-HTTP/2 upgrade rejected: ProxyServer.EnableWebSocketOverHttp2 is not enabled. " +
-                            "H1 client WebSocket requests cannot tunnel over HTTP/2 without this option.",
-                            null, args));
-
-                        var rejectionResponse = args.HttpClient.Response;
-                        rejectionResponse.StatusCode = 503;
-                        rejectionResponse.StatusDescription = "Service Unavailable";
-                        rejectionResponse.Headers.SetOrAddHeaderValue("Connection", "close");
-                        await WriteH1ResponseAsync(clientStream, rejectionResponse, ct);
-                        return; // exit loop
-                    }
-
-                    // Server already checked at init (ConsumeServerPrefaceAsync), but be defensive
-                    if (serverSettings.EnableConnectProtocol == 0)
-                    {
-                        exceptionFunc?.Invoke(new ProxyHttpException(
-                            "WebSocket-over-HTTP/2 upgrade rejected: server does not advertise ENABLE_CONNECT_PROTOCOL.",
-                            null, args));
-
-                        var rejectionResponse = args.HttpClient.Response;
-                        rejectionResponse.StatusCode = 503;
-                        rejectionResponse.StatusDescription = "Service Unavailable";
-                        rejectionResponse.Headers.SetOrAddHeaderValue("Connection", "close");
-                        await WriteH1ResponseAsync(clientStream, rejectionResponse, ct);
-                        return; // exit loop, cannot process this request
-                    }
-
                     // Extract client's Sec-WebSocket-Key and transform request to H2 CONNECT tunnel
                     wsClientKey = request.Headers.GetHeaderValueOrNull("Sec-WebSocket-Key");
                     request.Method = "CONNECT";

@@ -16,7 +16,7 @@ Report bugs or raise issues here. For programming help use [StackOverflow](http:
 * Supports mutual SSL authentication, proxy authentication & automatic upstream proxy detection
 * Supports kerberos, NTLM authentication over HTTP protocols on windows domain controlled networks
 * SOCKS4/5 Proxy support
-* HTTP/2 support but not tested in production environment (Only for .Net 6.0 or above)
+* HTTP/2 support and compilant with RFC 7540 and parts of RFC 9113 (Only for .Net 6.0 or above)
 * SOCKS5 with UDP Associate
 
 
@@ -32,7 +32,7 @@ Supports
 * Fix [outstanding bugs](https://github.com/justcoding121/Titanium-Web-Proxy/issues?q=is%3Aopen+is%3Aissue+label%3Abug)
 * Support reading request and response body as stream [#823](https://github.com/justcoding121/Titanium-Web-Proxy/issues/823)
 * Stop throwing new exceptions [#634](https://github.com/justcoding121/Titanium-Web-Proxy/issues/634)
-* Support HTTP 2.0 => Done (need to be tested)
+* Support HTTP 2.0 => Done (need to be tested more for bugs finding)
 
 #### Collaborators
 
