@@ -1,6 +1,8 @@
 #if NET6_0_OR_GREATER
 using System;
+using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using Titanium.Web.Proxy.Extensions;
@@ -275,8 +277,17 @@ namespace Titanium.Web.Proxy.Http2.Primitives
             else
             {
                 var response = (Response)rr;
-                encoder.EncodeHeader(writer, StaticTable.KnownHeaderStatus,
-                    response.StatusCode.ToString().GetByteString());
+                // RFC 7540 §8.1.2.4: Pseudo-headers MUST NOT be emitted in trailer headers
+                // Only encode :status for the initial HEADERS frame, not for trailers
+                if (!endStream)
+                {
+                    encoder.EncodeHeader(writer, StaticTable.KnownHeaderStatus,
+                        response.StatusCode.ToString().GetByteString());
+                }
+                else
+                {
+                    System.Diagnostics.Debug.WriteLine($"[H2] SendHeadersAsync TRAILER: Skipping :status encoding for endStream=true");
+                }
             }
 
             foreach (var header in rr.Headers)
@@ -290,6 +301,20 @@ namespace Titanium.Web.Proxy.Http2.Primitives
             frameHeader.Length = encoded.Length;
             frameHeader.Type   = Http2FrameType.Headers;
             frameHeader.Flags  = flags;
+
+            // Debug: trace headers being sent (especially trailers)
+            if (endStream && rr is Response)
+            {
+                var headerList = new System.Collections.Generic.List<(string, string)>();
+                var response = (Response)rr;
+                headerList.Add((":status", response.StatusCode.ToString()));
+                foreach (var h in rr.Headers)
+                    headerList.Add((h.Name, h.Value));
+                System.Diagnostics.Debug.WriteLine($"[H2] SendHeadersAsync: StreamId={frameHeader.StreamId}, EndStream=true (TRAILER HEADERS), " +
+                    $"StatusCode={response.StatusCode}, " +
+                    $"Headers={{{string.Join(", ", headerList.Select(x => $"{x.Item1}:{x.Item2}"))}}}, " +
+                    $"EncodedLen={encoded.Length}, Flags=0x{((byte)flags):X2}");
+            }
 
             frameHeader.CopyToBuffer(headerBuffer);
             await destination.WriteAsync(headerBuffer, 0, 9,              cancellationToken);

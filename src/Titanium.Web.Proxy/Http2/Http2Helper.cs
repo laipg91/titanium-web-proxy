@@ -240,6 +240,9 @@ namespace Titanium.Web.Proxy.Http2
                 // ==================== DATA frame ====================
                 if (type == Http2FrameType.Data && args != null)
                 {
+                    System.Diagnostics.Debug.WriteLine($"[H2] CopyHttp2FrameAsync: Processing DATA frame: streamId={streamId}, " +
+                        $"isClient={isClient}, length={read}, endStream={(flags & Http2FrameFlag.EndStream) != 0}");
+                    
                     if (isClient)
                         args.OnDataSent(buffer, 0, read);
                     else
@@ -373,6 +376,10 @@ namespace Titanium.Web.Proxy.Http2
                         var completeHeaderData = pendingMs.ToArray();
                         pendingHeaderBlocks.Remove(streamId);
 
+                        System.Diagnostics.Debug.WriteLine($"[H2] CopyHttp2FrameAsync: Decoding headers: streamId={streamId}, isClient={isClient}, " +
+                            $"length={completeHeaderData.Length}, endStream={endStream}, type={type}, " +
+                            $"sessions.Count={sessions.Count}");
+
                         var headerListener = new MyHeaderListener(
                             (name, value) =>
                             {
@@ -424,15 +431,30 @@ namespace Titanium.Web.Proxy.Http2
                                 var response = (Response)rr!;
                                 response.HttpVersion = HttpVersion.Version20;
 
-                                // todo: avoid string conversion
-                                string statusHack = HttpHeader.Encoding.GetString(headerListener.Status.Span);
-                                int.TryParse(statusHack, out int statusCode);
-                                response.StatusCode = statusCode;
+                                // RFC 7540 §8.1.2.4: Pseudo-headers must not be in trailers
+                                // For trailer frames (endStream=true with existing StatusCode), skip status update
+                                if (!endStream || response.StatusCode == 0)
+                                {
+                                    // todo: avoid string conversion
+                                    string statusHack = HttpHeader.Encoding.GetString(headerListener.Status.Span);
+                                    int.TryParse(statusHack, out int statusCode);
+                                    System.Diagnostics.Debug.WriteLine($"[H2] CopyHttp2FrameAsync: Decoded :status header: streamId={streamId}, " +
+                                        $"endStream={endStream}, statusHack='{statusHack}', statusCode={statusCode}, " +
+                                        $"response.StatusCode before={response.StatusCode}");
+                                    response.StatusCode = statusCode;
+                                }
+                                else
+                                {
+                                    System.Diagnostics.Debug.WriteLine($"[H2] CopyHttp2FrameAsync: SKIPPING :status update (trailer frame): " +
+                                        $"streamId={streamId}, response.StatusCode={response.StatusCode}");
+                                }
                                 response.StatusDescription = string.Empty;
                             }
                         }
                         catch (Exception ex)
                         {
+                            System.Diagnostics.Debug.WriteLine($"[H2] CopyHttp2FrameAsync: DECODE ERROR on stream {streamId}: " +
+                                $"{ex.GetType().Name}: {ex.Message}");
                             exceptionFunc?.Invoke(new ProxyHttpException("Failed to decode HTTP/2 headers", ex, args));
                         }
 
@@ -450,8 +472,13 @@ namespace Titanium.Web.Proxy.Http2
                                     ? args!.OnDataSent
                                     : args!.OnDataReceived;
                                 await WithWriteLockAsync(outputWriteLock,
-                                    () => Http2FrameWriter.SendHeadersAsync(
-                                        outputPeerSettings, encoderState, frameHeader, frameHeaderBuffer, rr, endStream, output, onHeadersForwarded, cancellationToken));
+                                    () => {
+                                        string outputDir = isClient ? "server" : "client";
+                                        System.Diagnostics.Debug.WriteLine($"[H2] CopyHttp2FrameAsync: Sending HEADERS to output: streamId={frameHeader.StreamId}, " +
+                                            $"endStream={endStream}, type={type}, output={outputDir}");
+                                        return Http2FrameWriter.SendHeadersAsync(
+                                            outputPeerSettings, encoderState, frameHeader, frameHeaderBuffer, rr, endStream, output, onHeadersForwarded, cancellationToken);
+                                    });
                             }
                         else
                         {
@@ -533,9 +560,14 @@ namespace Titanium.Web.Proxy.Http2
                                 {
                                     var response = (Response)rr;
                                     response.HttpVersion = HttpVersion.Version20;
-                                    string statusHack = HttpHeader.Encoding.GetString(headerListener.Status.Span);
-                                    int.TryParse(statusHack, out int statusCode);
-                                    response.StatusCode = statusCode;
+                                    // RFC 7540 §8.1.2.4: Pseudo-headers must not be in trailers
+                                    // For trailer frames (endStream=true with existing StatusCode), skip status update
+                                    if (!endStream || response.StatusCode == 0)
+                                    {
+                                        string statusHack = HttpHeader.Encoding.GetString(headerListener.Status.Span);
+                                        int.TryParse(statusHack, out int statusCode);
+                                        response.StatusCode = statusCode;
+                                    }
                                     response.StatusDescription = string.Empty;
                                 }
                             }
@@ -817,6 +849,7 @@ namespace Titanium.Web.Proxy.Http2
                 {
                     sessions.TryRemove(streamId, out _);
                     streamWindowSizes.Remove(streamId);
+                    System.Diagnostics.Debug.WriteLine($"[H2] CopyHttp2FrameAsync: Removing stream {streamId} from sessions (isClient={isClient}, endStream=true, type={type})");
                     System.Diagnostics.Debug.WriteLine("REMOVED CONN: " + connectionId + ", CLIENT: " + isClient + ", STREAM: " + streamId + ", TYPE: " + type);
                 }
 

@@ -1,8 +1,10 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Net;
 using System.Net.Http;
+using System.Net.Http.Headers;
 using System.Security.Cryptography.X509Certificates;
 using System.Text;
 using System.Threading.Tasks;
@@ -145,6 +147,78 @@ public class Http2Tests
     }
 
     [TestMethod]
+    public async Task Can_Run_Multiple_Grpc_Calls_Over_H2_Tls_Proxy()
+    {
+        // Regression coverage for https://github.com/justcoding121/Titanium-Web-Proxy/issues/838:
+        // a TLS gRPC client makes unary, server-streaming, client-streaming, then bidi-streaming calls
+        // through the proxy. The original issue reports the first call succeeds and the second fails.
+        using var testSuite = new TestSuite(false, HttpProtocols.Http2);
+        var server = testSuite.GetServer();
+        server.HandleRequest(HandleGrpcRequest);
+
+        using var directClient = new HttpClient(new HttpClientHandler
+        {
+            ServerCertificateCustomValidationCallback = (m, c, ch, er) => true
+        });
+        await AssertGrpcSequenceAsync(directClient, server.ListeningHttpsUrl);
+
+        var proxy = testSuite.GetProxy(null, true);
+        var proxyExceptions = new List<Exception>();
+        proxy.ExceptionFunc = ex => proxyExceptions.Add(ex);
+        proxy.ServerCertificateValidationCallback += (sender, e) =>
+        {
+            e.IsValid = true;
+            return Task.CompletedTask;
+        };
+
+        var explicitEndPoint = (ExplicitProxyEndPoint)proxy.ProxyEndPoints[0];
+        explicitEndPoint.BeforeTunnelConnectRequest += (sender, e) =>
+        {
+            e.DecryptSsl = true;
+            return Task.CompletedTask;
+        };
+
+        var handler = new HttpClientHandler
+        {
+            Proxy = new TestHelper.TestProxy($"http://localhost:{proxy.ProxyEndPoints[0].Port}", false),
+            UseProxy = true,
+            ServerCertificateCustomValidationCallback = (m, c, ch, er) => true
+        };
+
+        using var client = new HttpClient(handler);
+
+        try
+        {
+            await AssertGrpcSequenceAsync(client, server.ListeningHttpsUrl);
+        }
+        catch (Exception ex)
+        {
+            Assert.Fail($"gRPC over H2 TLS proxy failed: {ex}{Environment.NewLine}{FormatProxyExceptions(proxyExceptions)}");
+        }
+
+        Assert.AreEqual(0, proxyExceptions.Count, FormatProxyExceptions(proxyExceptions));
+    }
+
+    private static async Task AssertGrpcSequenceAsync(HttpClient client, string baseUrl)
+    {
+        CollectionAssert.AreEqual(
+            new[] { "unary:one" },
+            await SendGrpcCallAsync(client, baseUrl, "Unary", "one"));
+
+        CollectionAssert.AreEqual(
+            new[] { "server-stream:two:1", "server-stream:two:2" },
+            await SendGrpcCallAsync(client, baseUrl, "ServerStreaming", "two"));
+
+        CollectionAssert.AreEqual(
+            new[] { "client-stream:three,four,five" },
+            await SendGrpcCallAsync(client, baseUrl, "ClientStreaming", "three", "four", "five"));
+
+        CollectionAssert.AreEqual(
+            new[] { "bidi:six", "bidi:seven" },
+            await SendGrpcCallAsync(client, baseUrl, "BidiStreaming", "six", "seven"));
+    }
+
+    [TestMethod]
     public async Task Can_Translate_H1_Client_To_H2_Server_Chunked_Request()
     {
         // Server supports ONLY HTTP/2
@@ -172,6 +246,135 @@ public class Http2Tests
         Assert.AreEqual(HttpStatusCode.OK, response.StatusCode);
         var responseBody = await response.Content.ReadAsStringAsync();
         Assert.AreEqual("Response-Chunked-Chunked-Upload", responseBody);
+    }
+
+    private static async Task HandleGrpcRequest(HttpContext context)
+    {
+        Assert.AreEqual("HTTP/2", context.Request.Protocol);
+        Assert.AreEqual("application/grpc", context.Request.ContentType);
+
+        context.Response.StatusCode = 200;
+        context.Response.ContentType = "application/grpc";
+        context.Response.DeclareTrailer("grpc-status");
+
+        var requestMessages = await ReadGrpcMessagesAsync(context.Request.Body);
+        var method = context.Request.Path.Value?.Split('/').Last();
+        var responseMessages = method switch
+        {
+            "Unary" => new[] { "unary:" + requestMessages.Single() },
+            "ServerStreaming" => new[] { $"server-stream:{requestMessages.Single()}:1", $"server-stream:{requestMessages.Single()}:2" },
+            "ClientStreaming" => new[] { "client-stream:" + string.Join(",", requestMessages) },
+            "BidiStreaming" => requestMessages.Select(x => "bidi:" + x).ToArray(),
+            _ => throw new InvalidOperationException("Unexpected gRPC method: " + method)
+        };
+
+        foreach (var message in responseMessages)
+        {
+            var frame = CreateGrpcFrame(message);
+            await context.Response.Body.WriteAsync(frame, 0, frame.Length);
+            await context.Response.Body.FlushAsync();
+        }
+
+        context.Response.AppendTrailer("grpc-status", "0");
+    }
+
+    private static async Task<string[]> SendGrpcCallAsync(
+        HttpClient client, string baseUrl, string method, params string[] messages)
+    {
+        using var request = new HttpRequestMessage(HttpMethod.Post, $"{baseUrl}/grpc.integration.TestService/{method}")
+        {
+            Version = HttpVersion.Version20,
+            VersionPolicy = HttpVersionPolicy.RequestVersionExact,
+            Content = new ByteArrayContent(CreateGrpcPayload(messages))
+        };
+        request.Headers.TE.Add(new TransferCodingWithQualityHeaderValue("trailers"));
+        request.Content.Headers.ContentType = new MediaTypeHeaderValue("application/grpc");
+
+        using var response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead);
+        Assert.AreEqual(HttpStatusCode.OK, response.StatusCode);
+        Assert.AreEqual(HttpVersion.Version20, response.Version);
+
+        await using var responseBody = await response.Content.ReadAsStreamAsync();
+        var responseMessages = await ReadGrpcMessagesAsync(responseBody);
+
+        var grpcStatus = response.TrailingHeaders.TryGetValues("grpc-status", out var values)
+            ? values.Single()
+            : null;
+        Assert.AreEqual("0", grpcStatus, "gRPC response trailer grpc-status should be 0.");
+
+        return responseMessages;
+    }
+
+    private static byte[] CreateGrpcPayload(params string[] messages)
+    {
+        using var ms = new MemoryStream();
+        foreach (var message in messages)
+        {
+            var frame = CreateGrpcFrame(message);
+            ms.Write(frame, 0, frame.Length);
+        }
+
+        return ms.ToArray();
+    }
+
+    private static byte[] CreateGrpcFrame(string message)
+    {
+        var payload = Encoding.UTF8.GetBytes(message);
+        var frame = new byte[5 + payload.Length];
+        frame[0] = 0; // uncompressed
+        frame[1] = (byte)((payload.Length >> 24) & 0xff);
+        frame[2] = (byte)((payload.Length >> 16) & 0xff);
+        frame[3] = (byte)((payload.Length >> 8) & 0xff);
+        frame[4] = (byte)(payload.Length & 0xff);
+        Buffer.BlockCopy(payload, 0, frame, 5, payload.Length);
+        return frame;
+    }
+
+    private static async Task<string[]> ReadGrpcMessagesAsync(Stream stream)
+    {
+        var messages = new List<string>();
+        var header = new byte[5];
+
+        while (true)
+        {
+            int headerRead = await ReadAtLeastAsync(stream, header, header.Length);
+            if (headerRead == 0)
+                break;
+
+            Assert.AreEqual(header.Length, headerRead, "Incomplete gRPC message header.");
+            Assert.AreEqual(0, header[0], "Compressed gRPC messages are not used by this test.");
+
+            int length = (header[1] << 24) | (header[2] << 16) | (header[3] << 8) | header[4];
+            var payload = new byte[length];
+            int payloadRead = await ReadAtLeastAsync(stream, payload, length);
+            Assert.AreEqual(length, payloadRead, "Incomplete gRPC message payload.");
+            messages.Add(Encoding.UTF8.GetString(payload));
+        }
+
+        return messages.ToArray();
+    }
+
+    private static async Task<int> ReadAtLeastAsync(Stream stream, byte[] buffer, int count)
+    {
+        int total = 0;
+        while (total < count)
+        {
+            int read = await stream.ReadAsync(buffer, total, count - total);
+            if (read == 0)
+                break;
+
+            total += read;
+        }
+
+        return total;
+    }
+
+    private static string FormatProxyExceptions(IReadOnlyCollection<Exception> proxyExceptions)
+    {
+        return proxyExceptions.Count == 0
+            ? "No proxy exception captured."
+            : "Proxy exceptions:" + Environment.NewLine + string.Join(
+                Environment.NewLine + "---" + Environment.NewLine, proxyExceptions);
     }
     
     [TestMethod]

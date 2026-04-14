@@ -2,6 +2,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using Titanium.Web.Proxy.EventArguments;
@@ -462,11 +463,19 @@ namespace Titanium.Web.Proxy.Http2.Translation
                     var listener = new SimpleHeaderListener(headers);
                     try
                     {
+                        System.Diagnostics.Debug.WriteLine($"[H2] Http1ToHttp2Translator: Decoding HEADERS: streamId={streamId}, " +
+                            $"flags=0x{(int)flags:X2}, length={length}, endHeaders={((flags & Http2FrameFlag.EndHeaders) != 0)}, " +
+                            $"endStream={((flags & Http2FrameFlag.EndStream) != 0)}");
+                        
                         decoder.Decode(new BinaryReader(new MemoryStream(dataBuffer, 0, length)), listener);
                         decoder.EndHeaderBlock();
+                        
+                        System.Diagnostics.Debug.WriteLine($"[H2] Http1ToHttp2Translator: Decoded {headers.Count} headers: " +
+                            $"{{{string.Join(", ", headers.Select(h => $"{h.Item1}:{h.Item2}").Take(8))}}}");
                     }
                     catch (Exception ex)
                     {
+                        System.Diagnostics.Debug.WriteLine($"[H2] Http1ToHttp2Translator: DECODE ERROR: {ex.GetType().Name}: {ex.Message}");
                         exceptionFunc?.Invoke(new ProxyHttpException("Failed to decode H2 response headers", ex, null));
                         return;
                     }
