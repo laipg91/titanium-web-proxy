@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.ComponentModel;
 using Titanium.Web.Proxy.Exceptions;
 using Titanium.Web.Proxy.Extensions;
@@ -161,18 +161,32 @@ namespace Titanium.Web.Proxy.Http
 
         /// <summary>
         ///     Does this request has an upgrade to websocket header?
+        ///     Returns true for both HTTP/1.1 (Upgrade: websocket) and HTTP/2
+        ///     extended-CONNECT WebSocket requests (RFC 8441: :protocol = websocket).
         /// </summary>
         public bool UpgradeToWebSocket
         {
             get
             {
+                // HTTP/2 extended CONNECT (RFC 8441): CONNECT + :protocol: websocket
+                if (Http2Protocol != null)
+                    return Http2Protocol.Equals("websocket", StringComparison.OrdinalIgnoreCase);
+
+                // HTTP/1.1 classic: GET + Upgrade: websocket
                 var headerValue = Headers.GetHeaderValueOrNull(KnownHeaders.Upgrade);
-
                 if (headerValue == null) return false;
-
                 return headerValue.EqualsIgnoreCase(KnownHeaders.UpgradeWebsocket.String);
             }
         }
+
+        /// <summary>
+        ///     The value of the :protocol pseudo-header sent in an HTTP/2
+        ///     extended-CONNECT request (RFC 8441 §4).
+        ///     Set to "websocket" when the client wants to tunnel a WebSocket
+        ///     session over an HTTP/2 stream. <c>null</c> for plain HTTP/1.1 or
+        ///     ordinary HTTP/2 requests.
+        /// </summary>
+        public string? Http2Protocol { get; internal set; }
 
         /// <summary>
         ///     Did server respond positively for 100 continue request?

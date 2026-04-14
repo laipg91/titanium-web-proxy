@@ -56,7 +56,7 @@ namespace Titanium.Web.Proxy.Http2.Primitives
 
         /// <summary>
         /// Writes an empty SETTINGS frame (no flags) as the connection preface
-        /// when acting as an HTTP/2 server toward the client (RFC 7540 §3.5 / §6.5).
+        /// when acting as an HTTP/2 server toward the client (RFC 9113 §3.4 / §6.5).
         /// </summary>
         internal static async Task SendSettingsAsync(
             Stream destination, byte[] headerBuffer,
@@ -71,6 +71,41 @@ namespace Titanium.Web.Proxy.Http2.Primitives
             };
             header.CopyToBuffer(headerBuffer);
             await destination.WriteAsync(headerBuffer, 0, 9, cancellationToken);
+        }
+
+        /// <summary>
+        /// Writes a SETTINGS frame that advertises SETTINGS_ENABLE_CONNECT_PROTOCOL=1
+        /// (RFC 8441 §3) in addition to the standard empty preface.
+        /// Call this instead of <see cref="SendSettingsAsync"/> when the proxy must
+        /// inform the peer that extended CONNECT (WebSocket-over-H2) is supported.
+        /// </summary>
+        /// <remarks>
+        /// The SETTINGS payload is 6 bytes: 2-byte identifier (0x0008) + 4-byte value (0x00000001).
+        /// </remarks>
+        internal static async Task SendSettingsWithExtendedConnectAsync(
+            Stream destination, byte[] headerBuffer,
+            CancellationToken cancellationToken)
+        {
+            // 6-byte payload: id=0x0008, value=0x00000001
+            var payload = new byte[6];
+            payload[0] = 0x00;
+            payload[1] = 0x08;   // identifier = SETTINGS_ENABLE_CONNECT_PROTOCOL
+            payload[2] = 0x00;
+            payload[3] = 0x00;
+            payload[4] = 0x00;
+            payload[5] = 0x01;   // value = 1 (enabled)
+
+            var header = new Http2FrameHeader
+            {
+                Length   = payload.Length,
+                Type     = Http2FrameType.Settings,
+                Flags    = (Http2FrameFlag)0,
+                StreamId = 0
+            };
+            header.CopyToBuffer(headerBuffer);
+
+            await destination.WriteAsync(headerBuffer, 0, 9, cancellationToken);
+            await destination.WriteAsync(payload,      0, payload.Length, cancellationToken);
         }
 
         // ── SETTINGS ACK ──────────────────────────────────────────────────────
@@ -190,10 +225,20 @@ namespace Titanium.Web.Proxy.Http2.Primitives
             {
                 var uri = request.RequestUri;
                 encoder.EncodeHeader(writer, StaticTable.KnownHeaderMethod,    request.Method.GetByteString());
-                encoder.EncodeHeader(writer, StaticTable.KnownHeaderAuhtority, uri.Authority.GetByteString());
+                encoder.EncodeHeader(writer, StaticTable.KnownHeaderAuthority, uri.Authority.GetByteString());
                 encoder.EncodeHeader(writer, StaticTable.KnownHeaderScheme,    uri.Scheme.GetByteString());
                 encoder.EncodeHeader(writer, StaticTable.KnownHeaderPath,      request.RequestUriString8, false,
                     HpackUtil.IndexType.None, false);
+
+                // RFC 8441 §4: extended-CONNECT WebSocket streams carry :protocol.
+                // Must be encoded after the four mandatory pseudo-headers and before
+                // regular headers so the peer can identify the tunnelled protocol.
+                if (!string.IsNullOrEmpty(request.Http2Protocol))
+                {
+                    encoder.EncodeHeader(writer, StaticTable.KnownHeaderProtocol,
+                        request.Http2Protocol!.GetByteString(), false,
+                        HpackUtil.IndexType.None, false);
+                }
             }
             else
             {

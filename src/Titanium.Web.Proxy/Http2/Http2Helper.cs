@@ -53,10 +53,12 @@ namespace Titanium.Web.Proxy.Http2
 
             // HTTP/2 control frames are hop-local. The proxy establishes its own
             // SETTINGS state with both peers instead of relaying connection prefaces.
+            // Advertise SETTINGS_ENABLE_CONNECT_PROTOCOL=1 (RFC 8441 §3) so browsers
+            // and RFC 8441-aware servers know WebSocket-over-H2 is supported.
             await WithWriteLockAsync(clientWriteLock,
-                () => Http2FrameWriter.SendSettingsAsync(clientStream, clientFrameHeaderBuffer, cancellationTokenSource.Token));
+                () => Http2FrameWriter.SendSettingsWithExtendedConnectAsync(clientStream, clientFrameHeaderBuffer, cancellationTokenSource.Token));
             await WithWriteLockAsync(serverWriteLock,
-                () => Http2FrameWriter.SendSettingsAsync(serverStream, serverFrameHeaderBuffer, cancellationTokenSource.Token));
+                () => Http2FrameWriter.SendSettingsWithExtendedConnectAsync(serverStream, serverFrameHeaderBuffer, cancellationTokenSource.Token));
 
             // Now async relay all server=>client & client=>server data
             var sendRelay =
@@ -129,9 +131,14 @@ namespace Titanium.Web.Proxy.Http2
                 frameHeader.Flags = flags;
                 frameHeader.StreamId = streamId;
 
-                if (buffer == null || buffer.Length < inputPeerSettings.MaxFrameSize)
+                // Ensure buffer can hold the larger of: the negotiated MaxFrameSize and the
+                // actual declared frame length. A peer that sends a frame larger than the
+                // negotiated MaxFrameSize is committing a protocol violation, but we must
+                // not overflow our buffer — allocate defensively rather than crash.
+                int requiredSize = Math.Max(inputPeerSettings.MaxFrameSize, length);
+                if (buffer == null || buffer.Length < requiredSize)
                 {
-                    buffer = new byte[inputPeerSettings.MaxFrameSize];
+                    buffer = new byte[requiredSize];
                 }
 
                 read = await Http2FrameReader.ForceReadAsync(input, buffer, 0, length, cancellationToken);
@@ -367,17 +374,29 @@ namespace Titanium.Web.Proxy.Http2
                             if (rr is Request request)
                             {
                                 var method = headerListener.Method;
-                                var path = headerListener.Path;
-                                if (method.Length == 0 || path.Length == 0)
+                                var path   = headerListener.Path;
+
+                                // RFC 8441 §4: extended CONNECT requests include :protocol
+                                // and MUST still carry :scheme and :path, but guard against
+                                // misbehaving clients by only requiring at least a method.
+                                if (method.Length == 0)
                                 {
-                                    throw new Exception("HTTP/2 Missing method or path");
+                                    throw new Exception("HTTP/2 HEADERS frame is missing :method.");
                                 }
 
                                 request.HttpVersion = HttpVersion.Version20;
-                                request.Method = method.GetString();
-                                request.IsHttps = headerListener.Scheme == ProxyServer.UriSchemeHttps;
-                                request.Authority = headerListener.Authority;
-                                request.RequestUriString8 = path;
+                                request.Method      = method.GetString();
+                                request.IsHttps     = headerListener.Scheme == ProxyServer.UriSchemeHttps;
+                                request.Authority   = headerListener.Authority;
+
+                                // For extended CONNECT, :path may be present (RFC 8441 §4 requires it).
+                                // Fall back to "/" only if genuinely absent to avoid a crash.
+                                request.RequestUriString8 = path.Length > 0 ? path : (ByteString)"/";
+
+                                // Store :protocol so RequestHandler / translators can detect
+                                // WebSocket-over-H2 without scanning regular headers.
+                                if (headerListener.Protocol.Length > 0)
+                                    request.Http2Protocol = headerListener.Protocol.GetString();
                             }
                             else
                             {
@@ -483,6 +502,11 @@ namespace Titanium.Web.Proxy.Http2
                                         request.Authority = headerListener.Authority;
                                         request.RequestUriString8 = path;
                                     }
+
+                                    // RFC 8441 §4: :protocol may arrive in a CONTINUATION fragment.
+                                    // Mirror the same assignment done in the primary HEADERS branch.
+                                    if (headerListener.Protocol.Length > 0)
+                                        request.Http2Protocol = headerListener.Protocol.GetString();
                                 }
                                 else
                                 {
@@ -575,6 +599,13 @@ namespace Titanium.Web.Proxy.Http2
                                 case 6: // SETTINGS_MAX_HEADER_LIST_SIZE
                                     inputPeerSettings.MaxHeaderListSize = value < 0 ? int.MaxValue : value;
                                     break;
+                                case 8: // SETTINGS_ENABLE_CONNECT_PROTOCOL (RFC 8441 §3)
+                                    // Record that the peer supports extended CONNECT.
+                                    // We do not gate outgoing WebSocket streams on this flag
+                                    // (the proxy already advertised 1 in our own SETTINGS),
+                                    // but we store it for diagnostic / interop checks.
+                                    inputPeerSettings.EnableConnectProtocol = value;
+                                    break;
                             }
                         }
 
@@ -585,7 +616,8 @@ namespace Titanium.Web.Proxy.Http2
                     sendPacket = false;
                 }
                 // ==================== PING frame ====================
-                // Fix High: Reply to PING frames (RFC 7540 §6.7)
+                // PING is hop-local (RFC 7540 §6.7): proxy replies with PING+ACK to the
+                // sender and never relays PING or PING ACK to the other side.
                 else if (type == Http2FrameType.Ping)
                 {
                     bool isAck = (flags & Http2FrameFlag.Ack) != 0;
@@ -597,8 +629,9 @@ namespace Titanium.Web.Proxy.Http2
                         Array.Copy(buffer, pingPayload, Math.Min(8, length));
                         await WithWriteLockAsync(inputWriteLock,
                             () => Http2FrameWriter.SendPingAckAsync(input, frameHeaderBuffer, pingPayload, cancellationToken));
-                        sendPacket = false;
                     }
+
+                    // Never relay PING or PING ACK to the other peer — always consumed hop-locally.
                     sendPacket = false;
                 }
                 // ==================== WINDOW_UPDATE frame ====================
@@ -782,6 +815,12 @@ namespace Titanium.Web.Proxy.Http2
 
             public ByteString Path { get; private set; }
 
+            /// <summary>
+            /// Value of the :protocol pseudo-header (RFC 8441 §4).
+            /// Non-empty only for extended-CONNECT WebSocket streams.
+            /// </summary>
+            public ByteString Protocol { get; private set; }
+
             public string Scheme
             {
                 get
@@ -826,6 +865,13 @@ namespace Titanium.Web.Proxy.Http2
                             return;
                         case ":status":
                             Status = value;
+                            return;
+                        case ":protocol":
+                            // RFC 8441 §4: the :protocol pseudo-header identifies the
+                            // application protocol to be tunnelled (e.g. "websocket").
+                            // Stored separately so Request.Http2Protocol has a typed value
+                            // without needing to scan regular headers.
+                            Protocol = value;
                             return;
                     }
                 }

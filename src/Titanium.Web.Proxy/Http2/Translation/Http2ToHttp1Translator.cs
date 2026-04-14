@@ -2,6 +2,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Text;
 using System.Threading;
 using System.Threading.Channels;
 using System.Threading.Tasks;
@@ -12,6 +13,7 @@ using Titanium.Web.Proxy.Helpers;
 using Titanium.Web.Proxy.Http;
 using Titanium.Web.Proxy.Http2.Hpack;
 using Titanium.Web.Proxy.Http2.Primitives;
+using Titanium.Web.Proxy.Http2.WebSocket;
 using Titanium.Web.Proxy.Models;
 using Decoder = Titanium.Web.Proxy.Http2.Hpack.Decoder;
 
@@ -48,9 +50,11 @@ namespace Titanium.Web.Proxy.Http2.Translation
             var clientWriteLock = new SemaphoreSlim(1, 1);
             var serverFrameHeaderBuffer = new byte[9];
 
-            // Send the server connection preface first.
+            // Send the server connection preface first, advertising ENABLE_CONNECT_PROTOCOL=1
+            // (RFC 8441 §3) so that RFC 8441-compliant clients (e.g. Chrome) know they may
+            // send CONNECT+:protocol=websocket requests to this proxy.
             // ACKs and stream frames must not overtake this SETTINGS frame.
-            await Http2FrameWriter.SendSettingsAsync(clientStream, serverFrameHeaderBuffer, cts.Token);
+            await Http2FrameWriter.SendSettingsWithExtendedConnectAsync(clientStream, serverFrameHeaderBuffer, cts.Token);
 
             var readTask = ReadLoopAsync(
                 clientStream, clientSettings, new Http2FrameHeader(), new byte[9],
@@ -247,6 +251,8 @@ namespace Titanium.Web.Proxy.Http2.Translation
 
         /// <summary>
         /// Finalizes the decoding of headers for a stream and triggers the before-request hook.
+        /// Detects RFC 8441 extended-CONNECT WebSocket requests via :protocol=websocket
+        /// and marks the stream context accordingly so the write loop can route it correctly.
         /// </summary>
         private static async Task FinalizeHeadersAsync(
             int streamId,
@@ -269,7 +275,29 @@ namespace Titanium.Web.Proxy.Http2.Translation
             Http2HeaderConverter.ApplyToHttp1Request(context.Args.HttpClient.Request, decodedHeaders);
             context.Args.HttpClient.Request.SetOriginalHeaders();
 
+            // Detect RFC 8441 extended-CONNECT WebSocket: :method=CONNECT + :protocol=websocket
+            // Http2HeaderConverter.ApplyToHttp1Request already sets request.Method; we look for
+            // :protocol in the raw decoded list (it is NOT a standard request header).
+            foreach (var (name, value) in decodedHeaders)
+            {
+                if (name.Equals(":protocol", StringComparison.OrdinalIgnoreCase))
+                {
+                    context.Args.HttpClient.Request.Http2Protocol = value;
+                    break;
+                }
+            }
+
+            context.IsWebSocket = context.Args.HttpClient.Request.UpgradeToWebSocket;
+
             await onBeforeRequest(context.Args);
+
+            // WebSocket streams have no body before the tunnel opens.
+            if (context.IsWebSocket)
+            {
+                context.RequestBodyComplete = true;
+                await writer.WriteAsync(context, ct);
+                return;
+            }
 
             if (pendingHeader.EndStream)
             {
@@ -284,6 +312,8 @@ namespace Titanium.Web.Proxy.Http2.Translation
 
         /// <summary>
         /// Reads captured HTTP/2 streams from the queue and executes them against the HTTP/1.x server.
+        /// WebSocket streams are routed to <see cref="HandleWebSocketTunnelAsync"/>;
+        /// all other streams follow the normal HTTP/1.1 request/response cycle.
         /// </summary>
         private static async Task WriteLoopAsync(
             Stream serverStream,
@@ -307,7 +337,17 @@ namespace Titanium.Web.Proxy.Http2.Translation
                 {
                     try
                     {
-                        var request = context.Args.HttpClient.Request;
+                        // RFC 8441: route WebSocket streams to the tunnel handler
+                        if (context.IsWebSocket)
+                        {
+                            await HandleWebSocketTunnelAsync(
+                                serverStream, clientStream, clientSettings,
+                                frameHeader, headerBuffer, dataBuffer,
+                                context, encoderState, clientWriteLock, cts, exceptionFunc);
+                            continue;
+                        }
+
+                        var request  = context.Args.HttpClient.Request;
                         var response = context.Args.HttpClient.Response;
 
                         await SendH1RequestAsync(serverStream, request, context.RequestBody, ct);
@@ -353,6 +393,261 @@ namespace Titanium.Web.Proxy.Http2.Translation
             catch (OperationCanceledException)
             {
             }
+        }
+
+        // ── WebSocket tunnel (H2 client ↔ H1 server) ────────────────────────────
+
+        /// <summary>
+        /// Handles an RFC 8441 WebSocket tunnel when the H2 client sends
+        /// CONNECT+:protocol=websocket but the upstream server speaks HTTP/1.1.
+        ///
+        /// Protocol translation:
+        ///   H2 client  ─CONNECT+:protocol:websocket─▶  proxy
+        ///   proxy  ─GET Upgrade:websocket──────────▶  H1 server
+        ///   H1 server  ─101 Switching Protocols───▶  proxy  (validates Accept hash)
+        ///   proxy  ─:status 200─────────────────▶  H2 client
+        ///   ── bidirectional DATA frame relay ──
+        /// </summary>
+        private static async Task HandleWebSocketTunnelAsync(
+            Stream serverStream,
+            Stream clientStream,
+            Http2Settings clientSettings,
+            Http2FrameHeader frameHeader,
+            byte[] headerBuffer,
+            byte[] dataBuffer,
+            Http2StreamContext context,
+            Http2EncoderState encoderState,
+            SemaphoreSlim clientWriteLock,
+            CancellationTokenSource cts,
+            ExceptionHandler? exceptionFunc)
+        {
+            var ct      = cts.Token;
+            var request = context.Args.HttpClient.Request;
+
+            // ── Step 1: Send HTTP/1.1 GET Upgrade to the H1 server ──────────
+            // RFC 8441 §5: proxy generates its own Sec-WebSocket-Key so the
+            // H1 server can complete the challenge-response handshake.
+            var proxyKey = WebSocketHandshakeHelper.GenerateClientKey();
+
+            var upgradeBuilder = new StringBuilder();
+            upgradeBuilder.Append($"GET {request.RequestUri.PathAndQuery} HTTP/1.1\r\n");
+            upgradeBuilder.Append($"Host: {request.RequestUri.Authority}\r\n");
+            upgradeBuilder.Append("Upgrade: websocket\r\n");
+            upgradeBuilder.Append("Connection: Upgrade\r\n");
+            upgradeBuilder.Append($"Sec-WebSocket-Key: {proxyKey}\r\n");
+            upgradeBuilder.Append("Sec-WebSocket-Version: 13\r\n");
+
+            // Forward any non-forbidden application headers (e.g. Sec-WebSocket-Protocol)
+            foreach (var header in request.Headers)
+            {
+                if (!Http2HeaderConverter.IsH2ForbiddenRequestHeader(header.Name))
+                    upgradeBuilder.Append($"{header.Name}: {header.Value}\r\n");
+            }
+
+            upgradeBuilder.Append("\r\n");
+            var upgradeBytes = Encoding.ASCII.GetBytes(upgradeBuilder.ToString());
+            await serverStream.WriteAsync(upgradeBytes, 0, upgradeBytes.Length, ct);
+            await serverStream.FlushAsync(ct);
+
+            // ── Step 2: Read and validate H1 101 response ───────────────────
+            string? statusLine = await ReadLineFromStreamAsync(serverStream, ct);
+            if (string.IsNullOrEmpty(statusLine))
+            {
+                await WriteToClientAsync(clientWriteLock,
+                    () => Http2FrameWriter.SendRstStreamAsync(
+                        clientStream, headerBuffer, context.StreamId, 0x2 /*INTERNAL_ERROR*/, ct));
+                return;
+            }
+
+            var parts      = statusLine.Split(' ');
+            var statusCode = parts.Length > 1 && int.TryParse(parts[1], out var sc) ? sc : 0;
+
+            // Drain H1 response headers (we need Sec-WebSocket-Accept for validation)
+            string? acceptHeader = null;
+            while (true)
+            {
+                var line = await ReadLineFromStreamAsync(serverStream, ct);
+                if (string.IsNullOrEmpty(line)) break;
+
+                int colon = line.IndexOf(':');
+                if (colon > 0)
+                {
+                    var hName  = line.Substring(0, colon).Trim();
+                    var hValue = line.Substring(colon + 1).Trim();
+                    if (hName.Equals("Sec-WebSocket-Accept", StringComparison.OrdinalIgnoreCase))
+                        acceptHeader = hValue;
+                }
+            }
+
+            if (statusCode != 101)
+            {
+                // H1 server refused; signal RST_STREAM to the H2 client
+                exceptionFunc?.Invoke(new ProxyHttpException(
+                    $"H1 server rejected WebSocket upgrade with status {statusCode}", null, context.Args));
+                await WriteToClientAsync(clientWriteLock,
+                    () => Http2FrameWriter.SendRstStreamAsync(
+                        clientStream, headerBuffer, context.StreamId, 0x2 /*INTERNAL_ERROR*/, ct));
+                return;
+            }
+
+            // Validate the accept hash (lenient: log but continue on mismatch)
+            WebSocketHandshakeHelper.ValidateServerAccept(
+                proxyKey, acceptHeader,
+                msg => exceptionFunc?.Invoke(
+                    new ProxyHttpException($"WS handshake warning on stream {context.StreamId}: {msg}", null, context.Args)));
+
+            // ── Step 3: Reply :status 200 to the H2 client ─────────────────
+            // RFC 8441 §4: successful WebSocket upgrade over HTTP/2 returns 200, NOT 101
+            var status200 = new List<(string, string)> { (":status", "200") };
+            await WriteToClientAsync(clientWriteLock,
+                () => SendH2HeadersToClientAsync(
+                    clientStream, clientSettings, encoderState,
+                    frameHeader, headerBuffer,
+                    status200, context.StreamId, endStream: false, ct));
+
+            // ── Step 4: Bidirectional DATA relay until END_STREAM or reset ──
+            // Relay H2 DATA frames from client → raw bytes to H1 server, and
+            // H1 server bytes → H2 DATA frames to client.
+            var clientToServer = RelayH2DataToH1Async(
+                clientStream, serverStream, dataBuffer, context.StreamId, ct);
+            var serverToClient = RelayH1DataToH2Async(
+                serverStream, clientStream, clientSettings,
+                dataBuffer, frameHeader, headerBuffer,
+                context, encoderState, clientWriteLock, ct);
+
+            await Task.WhenAny(clientToServer, serverToClient);
+            cts.Cancel();
+            await Task.WhenAll(clientToServer, serverToClient);
+        }
+
+        /// <summary>
+        /// Reads H2 DATA frames from the client and writes raw WebSocket bytes
+        /// to the H1 server connection until END_STREAM is signalled.
+        /// </summary>
+        internal static async Task RelayH2DataToH1Async(
+            Stream clientStream,
+            Stream serverStream,
+            byte[] buffer,
+            int streamId,
+            CancellationToken ct)
+        {
+            var headerBuffer = new byte[9];
+            var frameHeader  = new Http2FrameHeader();
+
+            try
+            {
+                while (!ct.IsCancellationRequested)
+                {
+                    if (!await Http2FrameReader.TryReadFrameHeaderAsync(clientStream, headerBuffer, frameHeader, ct))
+                        return;
+
+                    int length  = frameHeader.Length;
+                    var type    = frameHeader.Type;
+                    var flags   = frameHeader.Flags;
+
+                    if (length > 0)
+                    {
+                        if (buffer.Length < length)
+                            buffer = new byte[length];
+
+                        int read = await Http2FrameReader.ForceReadAsync(clientStream, buffer, 0, length, ct);
+                        if (read != length) return;
+                    }
+
+                    // Only forward DATA frames for the current WebSocket stream
+                    if (type == Http2FrameType.Data && frameHeader.StreamId == streamId)
+                    {
+                        bool padded    = (flags & Http2FrameFlag.Padded) != 0;
+                        int  offset    = padded ? 1 : 0;
+                        int  padLen    = padded ? buffer[0] : 0;
+                        int  dataLen   = length - offset - padLen;
+
+                        if (dataLen > 0)
+                            await serverStream.WriteAsync(buffer, offset, dataLen, ct);
+
+                        await serverStream.FlushAsync(ct);
+
+                        // Client signalled end of WebSocket stream
+                        if ((flags & Http2FrameFlag.EndStream) != 0)
+                            return;
+                    }
+                    else if (type == Http2FrameType.RstStream && frameHeader.StreamId == streamId)
+                    {
+                        return;
+                    }
+                    // Other control frames (PING, WINDOW_UPDATE, etc.) are discarded;
+                    // the main Http2ToHttp1 read loop is no longer running for this connection.
+                }
+            }
+            catch (OperationCanceledException) { }
+            catch (IOException) { }
+        }
+
+        /// <summary>
+        /// Reads raw WebSocket bytes from the H1 server and wraps them into
+        /// H2 DATA frames sent back to the H2 client.
+        /// </summary>
+        internal static async Task RelayH1DataToH2Async(
+            Stream serverStream,
+            Stream clientStream,
+            Http2Settings clientSettings,
+            byte[] buffer,
+            Http2FrameHeader frameHeader,
+            byte[] headerBuffer,
+            Http2StreamContext context,
+            Http2EncoderState encoderState,
+            SemaphoreSlim clientWriteLock,
+            CancellationToken ct)
+        {
+            // Allocate a private small buffer to avoid racing with the headerBuffer reused elsewhere.
+            var privateHeader = new byte[9];
+
+            try
+            {
+                while (!ct.IsCancellationRequested)
+                {
+                    // Resize buffer if needed (server may send large WebSocket frames)
+                    var readBuf = buffer.Length >= clientSettings.MaxFrameSize
+                        ? buffer
+                        : new byte[clientSettings.MaxFrameSize];
+
+                    int read = await serverStream.ReadAsync(readBuf, 0, readBuf.Length, ct);
+                    if (read == 0)
+                        break; // server closed connection
+
+                    context.Args.OnDataReceived(readBuf, 0, read);
+
+                    // Wrap data in H2 DATA frame (no END_STREAM — tunnel stays open)
+                    var dataFrameHeader = new Http2FrameHeader
+                    {
+                        Length   = read,
+                        Type     = Http2FrameType.Data,
+                        Flags    = (Http2FrameFlag)0,
+                        StreamId = context.StreamId
+                    };
+                    dataFrameHeader.CopyToBuffer(privateHeader);
+
+                    await WriteToClientAsync(clientWriteLock, async () =>
+                    {
+                        await clientStream.WriteAsync(privateHeader, 0, 9, ct);
+                        await clientStream.WriteAsync(readBuf,       0, read, ct);
+                    });
+                }
+
+                // Server closed — send DATA+END_STREAM to H2 client
+                var endHeader = new Http2FrameHeader
+                {
+                    Length   = 0,
+                    Type     = Http2FrameType.Data,
+                    Flags    = Http2FrameFlag.EndStream,
+                    StreamId = context.StreamId
+                };
+                endHeader.CopyToBuffer(privateHeader);
+                await WriteToClientAsync(clientWriteLock, async () =>
+                    await clientStream.WriteAsync(privateHeader, 0, 9, ct));
+            }
+            catch (OperationCanceledException) { }
+            catch (IOException) { }
         }
 
         /// <summary>
@@ -671,12 +966,18 @@ namespace Titanium.Web.Proxy.Http2.Translation
             }
         }
 
-        private sealed class Http2StreamContext
+        internal sealed class Http2StreamContext
         {
             public int StreamId { get; }
             public SessionEventArgs Args { get; }
             public MemoryStream? RequestBody { get; set; }
             public bool RequestBodyComplete { get; set; }
+
+            /// <summary>
+            /// True when this stream carries a WebSocket tunnel
+            /// (RFC 8441: CONNECT + :protocol=websocket).
+            /// </summary>
+            public bool IsWebSocket { get; set; }
 
             public Http2StreamContext(int streamId, SessionEventArgs args)
             {

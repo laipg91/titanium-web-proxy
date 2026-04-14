@@ -11,6 +11,7 @@ using Titanium.Web.Proxy.Helpers;
 using Titanium.Web.Proxy.Http;
 using Titanium.Web.Proxy.Http2.Hpack;
 using Titanium.Web.Proxy.Http2.Primitives;
+using Titanium.Web.Proxy.Http2.WebSocket;
 using Titanium.Web.Proxy.Models;
 using Decoder = Titanium.Web.Proxy.Http2.Hpack.Decoder;
 
@@ -113,6 +114,22 @@ namespace Titanium.Web.Proxy.Http2.Translation
 
                 var request = args.HttpClient.Request;
 
+                // ── WebSocket Intercept (H1 client ↔ H2 server) ──────────────
+                bool isWebSocket = request.UpgradeToWebSocket;
+                string? wsClientKey = null;
+
+                if (isWebSocket)
+                {
+                    // Extract client's Sec-WebSocket-Key and transform request to H2 CONNECT tunnel
+                    wsClientKey = request.Headers.GetHeaderValueOrNull("Sec-WebSocket-Key");
+                    request.Method = "CONNECT";
+                    request.Http2Protocol = "websocket";
+
+                    // Remove legacy auth metadata before encoding to H2
+                    request.Headers.RemoveHeader("Sec-WebSocket-Key");
+                    request.Headers.RemoveHeader("Sec-WebSocket-Version");
+                }
+
                 // ── Encode and send H2 HEADERS frame to server ───────────────
                 int streamId = nextStreamId;
                 nextStreamId += 2;
@@ -121,10 +138,11 @@ namespace Titanium.Web.Proxy.Http2.Translation
                 await SendH2RequestHeadersAsync(
                     serverStream, serverSettings, encoderState,
                     frameHeader, frameHeaderBuf,
-                    h2Headers, streamId, !request.HasBody, ct);
+                    h2Headers, streamId, !request.HasBody && !isWebSocket, ct);
 
                 // ── Stream request body as DATA frames ───────────────────────
-                if (request.HasBody)
+                // WebSocket tunnel bodies are bidirectional infinite streams handled later.
+                if (request.HasBody && !isWebSocket)
                     await ForwardBodyAsDataFramesAsync(
                         clientStream, serverStream,
                         frameHeader, frameHeaderBuf, dataBuffer, args, streamId, ct);
@@ -140,8 +158,43 @@ namespace Titanium.Web.Proxy.Http2.Translation
                 // Fire before-response hook
                 await onBeforeResponse(args);
 
+                if (isWebSocket && response.StatusCode == 200)
+                {
+                    // RFC 8441 §5: Translate H2 200 OK back to H1 101 Switching Protocols.
+                    // The server didn't provide Sec-WebSocket-Accept because H2 doesn't need it,
+                    // so the proxy MUST compute it for the legacy H1 client.
+                    response.StatusCode = 101;
+                    response.StatusDescription = "Switching Protocols";
+                    response.Headers.SetOrAddHeaderValue("Connection", "Upgrade");
+                    response.Headers.SetOrAddHeaderValue("Upgrade", "websocket");
+
+                    if (!string.IsNullOrEmpty(wsClientKey))
+                    {
+                        var acceptHash = WebSocketHandshakeHelper.ComputeAcceptKey(wsClientKey);
+                        response.Headers.SetOrAddHeaderValue("Sec-WebSocket-Accept", acceptHash);
+                    }
+                }
+
                 // ── Write HTTP/1.x response to client ────────────────────────
                 await WriteH1ResponseAsync(clientStream, response, ct);
+
+                // ── WebSocket DATA frame tunnel ──────────────────────────────
+                if (isWebSocket && response.StatusCode == 101)
+                {
+                    var clientToServer = Http2ToHttp1Translator.RelayH1DataToH2Async(
+                        clientStream, serverStream, serverSettings,
+                        dataBuffer, frameHeader, frameHeaderBuf,
+                        new Http2ToHttp1Translator.Http2StreamContext(streamId, args),
+                        encoderState, new SemaphoreSlim(1, 1), ct);
+
+                    var serverToClient = Http2ToHttp1Translator.RelayH2DataToH1Async(
+                        serverStream, clientStream, dataBuffer, streamId, ct);
+
+                    await Task.WhenAny(clientToServer, serverToClient);
+                    cts.Cancel();
+                    await Task.WhenAll(clientToServer, serverToClient);
+                    return; // exit loop, tunnel ended
+                }
 
                 args.Dispose();
 
@@ -467,12 +520,13 @@ namespace Titanium.Web.Proxy.Http2.Translation
                           | (buffer[pos++] << 8)  |  buffer[pos++];
                 switch (id)
                 {
-                    case 1: settings.HeaderTableSize     = value; break;
-                    case 2: settings.EnablePush          = value; break;
+                    case 1: settings.HeaderTableSize      = value; break;
+                    case 2: settings.EnablePush           = value; break;
                     case 3: settings.MaxConcurrentStreams = value < 0 ? int.MaxValue : value; break;
-                    case 4: settings.InitialWindowSize   = value; break;
-                    case 5: settings.MaxFrameSize        = value; break;
-                    case 6: settings.MaxHeaderListSize   = value < 0 ? int.MaxValue : value; break;
+                    case 4: settings.InitialWindowSize    = value; break;
+                    case 5: settings.MaxFrameSize         = value; break;
+                    case 6: settings.MaxHeaderListSize    = value < 0 ? int.MaxValue : value; break;
+                    case 8: settings.EnableConnectProtocol = value; break; // RFC 8441 §3
                 }
             }
         }

@@ -54,6 +54,11 @@ namespace Titanium.Web.Proxy.Http2.Translation
                 (":path", path),
             };
 
+            if (!string.IsNullOrEmpty(request.Http2Protocol))
+            {
+                 headers.Add((":protocol", request.Http2Protocol!));
+            }
+
             foreach (var header in request.Headers)
             {
                 if (ShouldSkipRequestHeader(header.Name, connectionTokens))
@@ -185,6 +190,18 @@ namespace Titanium.Web.Proxy.Http2.Translation
             return CommonForbiddenHeaders.Contains(name) ||
                    RequestForbiddenHeaders.Contains(name) ||
                    connectionTokens.Contains(name);
+        }
+
+        /// <summary>
+        /// Returns true when <paramref name="name"/> is a header that MUST NOT
+        /// be forwarded over HTTP/2 (RFC 9113 §8.2.1) or is HTTP/2-specific and
+        /// therefore meaningless to an HTTP/1.1 server.
+        /// Used by the WebSocket tunnel to filter application headers before
+        /// emitting the synthetic HTTP/1.1 GET Upgrade request.
+        /// </summary>
+        internal static bool IsH2ForbiddenRequestHeader(string name)
+        {
+            return CommonForbiddenHeaders.Contains(name) || RequestForbiddenHeaders.Contains(name);
         }
 
         private static bool ShouldSkipResponseHeader(string name, HashSet<string> connectionTokens)

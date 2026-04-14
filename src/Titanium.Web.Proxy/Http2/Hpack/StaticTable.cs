@@ -37,7 +37,7 @@ namespace Titanium.Web.Proxy.Http2.Hpack
         /// <summary>
         /// :authority
         /// </summary>
-        public static ByteString KnownHeaderAuhtority = (ByteString)":authority";
+        public static ByteString KnownHeaderAuthority = (ByteString)":authority";
 
         /// <summary>
         /// :method
@@ -59,12 +59,22 @@ namespace Titanium.Web.Proxy.Http2.Hpack
         /// </summary>
         public static ByteString KnownHeaderStatus = (ByteString)":status";
 
+        /// <summary>
+        /// :protocol — RFC 8441 §4.
+        /// Carries the application protocol that will be tunnelled over an HTTP/2
+        /// stream via the extended CONNECT method (e.g. "websocket").
+        /// This pseudo-header is NOT in the HPACK static table; it must be
+        /// sent as a literal, but we keep a typed constant here so that
+        /// header-listener code can compare without string allocation.
+        /// </summary>
+        public static ByteString KnownHeaderProtocol = (ByteString)":protocol";
+
         static StaticTable()
         {
             const int entryCount = 61;
             staticTable = new List<HttpHeader>(entryCount);
             staticIndexByName = new Dictionary<ByteString, int>(entryCount);
-            Create(KnownHeaderAuhtority, string.Empty); // 1
+            Create(KnownHeaderAuthority, string.Empty); // 1
             Create(KnownHeaderMethod, "GET"); // 2
             Create(KnownHeaderMethod, "POST"); // 3
             Create(KnownHeaderPath, "/"); // 4
