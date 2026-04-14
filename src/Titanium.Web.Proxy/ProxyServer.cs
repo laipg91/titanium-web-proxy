@@ -152,6 +152,22 @@ namespace Titanium.Web.Proxy
         public bool EnableHttp2 { get; set; } = false;
 
         /// <summary>
+        ///     Enable WebSocket over HTTP/2 support (RFC 8441 extended-CONNECT).
+        ///     When enabled, the proxy advertises SETTINGS_ENABLE_CONNECT_PROTOCOL=1 to both clients and servers,
+        ///     allowing WebSocket connections to be tunneled over HTTP/2 streams instead of plain H1 TCP sockets.
+        ///     
+        ///     Requires: EnableHttp2 = true
+        ///     
+        ///     Supported scenarios:
+        ///     - H1 client → H2 backend: Proxy translates "Upgrade: websocket" to "CONNECT+:protocol=websocket"
+        ///     - H2 client → H1 backend: Proxy translates "CONNECT+:protocol=websocket" to "Upgrade: websocket"
+        ///     - H2 client → H2 backend: Native H2 WebSocket tunnel (multiplexed stream)
+        ///     
+        ///     Default: false (WebSocket over HTTP/2 disabled until explicitly enabled)
+        /// </summary>
+        public bool EnableWebSocketOverHttp2 { get; set; } = false;
+
+        /// <summary>
         ///     Should we check for certificate revocation during SSL authentication to servers
         ///     Note: If enabled can reduce performance. Defaults to false.
         /// </summary>

@@ -328,7 +328,8 @@ namespace Titanium.Web.Proxy
                         async a => await OnBeforeResponse(a),
                         cancellationTokenSource,
                         args.ClientConnection.Id,
-                        ExceptionFunc);
+                        ExceptionFunc,
+                        enableWebSocketOverHttp2: this.EnableWebSocketOverHttp2);
 
                     return false; // stop keep-alive loop — translator handled it internally
                 }

@@ -38,7 +38,8 @@ namespace Titanium.Web.Proxy.Http2.Translation
             Func<SessionEventArgs, Task> onBeforeResponse,
             CancellationTokenSource cts,
             Guid connectionId,
-            ExceptionHandler? exceptionFunc)
+            ExceptionHandler? exceptionFunc,
+            bool enableWebSocketOverHttp2 = false)
         {
             _ = initialSession;
             _ = connectionId;
@@ -50,11 +51,18 @@ namespace Titanium.Web.Proxy.Http2.Translation
             var clientWriteLock = new SemaphoreSlim(1, 1);
             var serverFrameHeaderBuffer = new byte[9];
 
-            // Send the server connection preface first, advertising ENABLE_CONNECT_PROTOCOL=1
-            // (RFC 8441 §3) so that RFC 8441-compliant clients (e.g. Chrome) know they may
-            // send CONNECT+:protocol=websocket requests to this proxy.
-            // ACKs and stream frames must not overtake this SETTINGS frame.
-            await Http2FrameWriter.SendSettingsWithExtendedConnectAsync(clientStream, serverFrameHeaderBuffer, cts.Token);
+            // Send the server connection preface first.
+            // If EnableWebSocketOverHttp2 is true, advertise SETTINGS_ENABLE_CONNECT_PROTOCOL=1
+            // (RFC 8441 §3) so clients know WebSocket-over-H2 is supported.
+            // Otherwise, send standard empty SETTINGS frame.
+            if (enableWebSocketOverHttp2)
+            {
+                await Http2FrameWriter.SendSettingsWithExtendedConnectAsync(clientStream, serverFrameHeaderBuffer, cts.Token);
+            }
+            else
+            {
+                await Http2FrameWriter.SendSettingsAsync(clientStream, serverFrameHeaderBuffer, cts.Token);
+            }
 
             var readTask = ReadLoopAsync(
                 clientStream, clientSettings, new Http2FrameHeader(), new byte[9],

@@ -40,7 +40,7 @@ namespace Titanium.Web.Proxy.Http2
             Func<SessionEventArgs> sessionFactory,
             Func<SessionEventArgs, Task> onBeforeRequest, Func<SessionEventArgs, Task> onBeforeResponse,
             CancellationTokenSource cancellationTokenSource, Guid connectionId,
-            ExceptionHandler? exceptionFunc)
+            ExceptionHandler? exceptionFunc, bool enableWebSocketOverHttp2 = false)
         {
             var clientSettings = new Http2Settings();
             var serverSettings = new Http2Settings();
@@ -53,12 +53,23 @@ namespace Titanium.Web.Proxy.Http2
 
             // HTTP/2 control frames are hop-local. The proxy establishes its own
             // SETTINGS state with both peers instead of relaying connection prefaces.
-            // Advertise SETTINGS_ENABLE_CONNECT_PROTOCOL=1 (RFC 8441 §3) so browsers
-            // and RFC 8441-aware servers know WebSocket-over-H2 is supported.
-            await WithWriteLockAsync(clientWriteLock,
-                () => Http2FrameWriter.SendSettingsWithExtendedConnectAsync(clientStream, clientFrameHeaderBuffer, cancellationTokenSource.Token));
-            await WithWriteLockAsync(serverWriteLock,
-                () => Http2FrameWriter.SendSettingsWithExtendedConnectAsync(serverStream, serverFrameHeaderBuffer, cancellationTokenSource.Token));
+            // Advertise SETTINGS_ENABLE_CONNECT_PROTOCOL=1 (RFC 8441 §3) only if
+            // WebSocket-over-HTTP/2 is explicitly enabled via ProxyServer.EnableWebSocketOverHttp2.
+            if (enableWebSocketOverHttp2)
+            {
+                await WithWriteLockAsync(clientWriteLock,
+                    () => Http2FrameWriter.SendSettingsWithExtendedConnectAsync(clientStream, clientFrameHeaderBuffer, cancellationTokenSource.Token));
+                await WithWriteLockAsync(serverWriteLock,
+                    () => Http2FrameWriter.SendSettingsWithExtendedConnectAsync(serverStream, serverFrameHeaderBuffer, cancellationTokenSource.Token));
+            }
+            else
+            {
+                // Send standard empty SETTINGS frame (no extended-CONNECT support)
+                await WithWriteLockAsync(clientWriteLock,
+                    () => Http2FrameWriter.SendSettingsAsync(clientStream, clientFrameHeaderBuffer, cancellationTokenSource.Token));
+                await WithWriteLockAsync(serverWriteLock,
+                    () => Http2FrameWriter.SendSettingsAsync(serverStream, serverFrameHeaderBuffer, cancellationTokenSource.Token));
+            }
 
             // Now async relay all server=>client & client=>server data
             var sendRelay =

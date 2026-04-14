@@ -47,7 +47,8 @@ namespace Titanium.Web.Proxy.Http2.Translation
             Func<SessionEventArgs, Task> onBeforeResponse,
             CancellationTokenSource cts,
             Guid connectionId,
-            ExceptionHandler? exceptionFunc)
+            ExceptionHandler? exceptionFunc,
+            bool enableWebSocketOverHttp2 = false)
         {
             var ct             = cts.Token;
             var serverSettings = new Http2Settings();
@@ -120,6 +121,26 @@ namespace Titanium.Web.Proxy.Http2.Translation
 
                 if (isWebSocket)
                 {
+                    // Check if upstream H2 server supports RFC 8441 extended-CONNECT
+                    // If not, we cannot tunnel WebSocket over H2 — must reject or fallback
+                    if (serverSettings.EnableConnectProtocol == 0)
+                    {
+                        // Server doesn't advertise support for extended-CONNECT
+                        // Log warning and reject the request
+                        exceptionFunc?.Invoke(new ProxyHttpException(
+                            "WebSocket-over-HTTP/2 rejected: upstream H2 server does not advertise ENABLE_CONNECT_PROTOCOL. " +
+                            "Server must support RFC 8441 for WebSocket tunneling.",
+                            null, args));
+
+                        // Return 503 Service Unavailable to client
+                        var rejectionResponse = args.HttpClient.Response;
+                        rejectionResponse.StatusCode = 503;
+                        rejectionResponse.StatusDescription = "Service Unavailable";
+                        rejectionResponse.Headers.SetOrAddHeaderValue("Connection", "close");
+                        await WriteH1ResponseAsync(clientStream, rejectionResponse, ct);
+                        return; // exit loop, cannot process this request
+                    }
+
                     // Extract client's Sec-WebSocket-Key and transform request to H2 CONNECT tunnel
                     wsClientKey = request.Headers.GetHeaderValueOrNull("Sec-WebSocket-Key");
                     request.Method = "CONNECT";

@@ -42,7 +42,8 @@ namespace Titanium.Web.Proxy.Http2.Translation
             Func<SessionEventArgs, Task> onBeforeResponse,
             CancellationTokenSource cts,
             Guid connectionId,
-            ExceptionHandler? exceptionFunc);
+            ExceptionHandler? exceptionFunc,
+            bool enableWebSocketOverHttp2 = false);
     }
 }
 #endif

@@ -321,7 +321,8 @@ namespace Titanium.Web.Proxy
                                     },
                                     async args => { await OnBeforeRequest(args); },
                                     async args => { await OnBeforeResponse(args); },
-                                    connectArgs.CancellationTokenSource, clientStream.Connection.Id, ExceptionFunc);
+                                    connectArgs.CancellationTokenSource, clientStream.Connection.Id, ExceptionFunc,
+                                    enableWebSocketOverHttp2: this.EnableWebSocketOverHttp2);
                             }
                             else
                             {
@@ -336,7 +337,8 @@ namespace Titanium.Web.Proxy
                                     },
                                     async args => { await OnBeforeRequest(args); },
                                     async args => { await OnBeforeResponse(args); },
-                                    connectArgs.CancellationTokenSource, clientStream.Connection.Id, ExceptionFunc);
+                                    connectArgs.CancellationTokenSource, clientStream.Connection.Id, ExceptionFunc,
+                                    enableWebSocketOverHttp2: this.EnableWebSocketOverHttp2);
                             }
 #endif
                         }
