@@ -41,6 +41,11 @@ namespace Titanium.Web.Proxy.Http
         internal string RequestMethod { get; set; }
 
         /// <summary>
+        ///     HTTP/2 trailer headers collected separately from the initial response headers.
+        /// </summary>
+        internal HeaderCollection Http2TrailerHeaders { get; } = new();
+
+        /// <summary>
         ///     Has response body?
         /// </summary>
         public override bool HasBody

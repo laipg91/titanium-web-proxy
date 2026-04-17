@@ -215,7 +215,7 @@ namespace Titanium.Web.Proxy.Http2.Primitives
 
         /// <summary>
         /// HPACK-encodes and writes a HEADERS frame for a request or response.
-        /// Re-uses the stateful <paramref name="encoderState"/> (Fix 1: HPACK stateful encoder).
+        /// Recreates the encoder per header block to avoid cross-stream state bleed.
         /// </summary>
         internal static async Task SendHeadersAsync(
             Http2Settings remoteSettings,
@@ -228,18 +228,10 @@ namespace Titanium.Web.Proxy.Http2.Primitives
             Action<byte[], int, int>? onWritten,
             CancellationToken cancellationToken)
         {
-            // Maintain stateful encoder (only recreate when HeaderTableSize decreases).
-            if (encoderState.Encoder == null ||
-                remoteSettings.HeaderTableSize < encoderState.HeaderTableSize)
-            {
-                encoderState.HeaderTableSize = remoteSettings.HeaderTableSize;
-                encoderState.Encoder = new Encoder(remoteSettings.HeaderTableSize);
-            }
-            else if (remoteSettings.HeaderTableSize > encoderState.HeaderTableSize)
-            {
-                encoderState.HeaderTableSize = remoteSettings.HeaderTableSize;
-            }
-
+            // Favor correctness over compression ratio: a fresh encoder per header block
+            // avoids carrying dynamic-table state across unrelated streams.
+            encoderState.HeaderTableSize = remoteSettings.HeaderTableSize;
+            encoderState.Encoder = new Encoder(remoteSettings.HeaderTableSize);
             var encoder = encoderState.Encoder;
             using var ms = new MemoryStream();
             var writer  = new BinaryWriter(ms);
@@ -290,7 +282,13 @@ namespace Titanium.Web.Proxy.Http2.Primitives
                 }
             }
 
-            foreach (var header in rr.Headers)
+            IEnumerable<HttpHeader> headersToEncode = rr.Headers;
+            if (rr is Response trailerResponse && endStream)
+            {
+                headersToEncode = trailerResponse.Http2TrailerHeaders;
+            }
+
+            foreach (var header in headersToEncode)
                 encoder.EncodeHeader(writer, header.NameData, header.ValueData);
 
             var encoded  = ms.ToArray();
@@ -307,8 +305,7 @@ namespace Titanium.Web.Proxy.Http2.Primitives
             {
                 var headerList = new System.Collections.Generic.List<(string, string)>();
                 var response = (Response)rr;
-                headerList.Add((":status", response.StatusCode.ToString()));
-                foreach (var h in rr.Headers)
+                foreach (var h in response.Http2TrailerHeaders)
                     headerList.Add((h.Name, h.Value));
                 System.Diagnostics.Debug.WriteLine($"[H2] SendHeadersAsync: StreamId={frameHeader.StreamId}, EndStream=true (TRAILER HEADERS), " +
                     $"StatusCode={response.StatusCode}, " +
@@ -375,7 +372,7 @@ namespace Titanium.Web.Proxy.Http2.Primitives
     // ── EncoderState ──────────────────────────────────────────────────────────
 
     /// <summary>
-    /// Holds stateful HPACK encoder for one connection direction.
+    /// Holds the current encoder settings container for one connection direction.
     /// Needed because async methods cannot use ref parameters.
     /// </summary>
     internal sealed class Http2EncoderState

@@ -103,7 +103,7 @@ namespace Titanium.Web.Proxy.Http2
             int headerTableSize = 0;
             Decoder? decoder = null;
 
-            // Stateful encoder per connection direction (Medium fix: reuse encoder for HPACK compression)
+            // Encoder settings holder per connection direction.
             // Note: EncoderState wrapper used because async methods cannot have ref parameters.
             var encoderState = new Http2EncoderState();
 
@@ -380,10 +380,16 @@ namespace Titanium.Web.Proxy.Http2
                             $"length={completeHeaderData.Length}, endStream={endStream}, type={type}, " +
                             $"sessions.Count={sessions.Count}");
 
+                        bool isTrailerFrame = !isClient && rr is Response responseForHeaders && endStream &&
+                            responseForHeaders.StatusCode != 0;
                         var headerListener = new MyHeaderListener(
                             (name, value) =>
                             {
-                                var headers = isClient ? args!.HttpClient.Request.Headers : args!.HttpClient.Response.Headers;
+                                var headers = isClient
+                                    ? args!.HttpClient.Request.Headers
+                                    : isTrailerFrame
+                                        ? args!.HttpClient.Response.Http2TrailerHeaders
+                                        : args!.HttpClient.Response.Headers;
                                 headers.AddHeader(new HttpHeader(name, value));
                             });
                         try
@@ -524,7 +530,13 @@ namespace Titanium.Web.Proxy.Http2
                             var headerListener = new MyHeaderListener(
                                 (name, value) =>
                                 {
-                                    var headers = isClient ? args!.HttpClient.Request.Headers : args!.HttpClient.Response.Headers;
+                                    bool isTrailerFrame = !isClient && rr is Response responseForContinuation && endStream &&
+                                        responseForContinuation.StatusCode != 0;
+                                    var headers = isClient
+                                        ? args!.HttpClient.Request.Headers
+                                        : isTrailerFrame
+                                            ? args!.HttpClient.Response.Http2TrailerHeaders
+                                            : args!.HttpClient.Response.Headers;
                                     headers.AddHeader(new HttpHeader(name, value));
                                 });
                             try
@@ -591,7 +603,7 @@ namespace Titanium.Web.Proxy.Http2
                                     : args.OnDataReceived;
                                 await WithWriteLockAsync(outputWriteLock,
                                     () => Http2FrameWriter.SendHeadersAsync(
-                                        outputPeerSettings, encoderState, frameHeader, frameHeaderBuffer, rr, false, output, onHeadersForwarded, cancellationToken));
+                                        outputPeerSettings, encoderState, frameHeader, frameHeaderBuffer, rr, endStream, output, onHeadersForwarded, cancellationToken));
                             }
                             else
                             {
