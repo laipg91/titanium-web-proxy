@@ -228,12 +228,17 @@ namespace Titanium.Web.Proxy.Http2.Primitives
             Action<byte[], int, int>? onWritten,
             CancellationToken cancellationToken)
         {
-            if (encoderState.Encoder == null || remoteSettings.HeaderTableSize != encoderState.HeaderTableSize)
+            if (encoderState.Encoder == null ||
+               remoteSettings.HeaderTableSize < encoderState.HeaderTableSize)
             {
                 encoderState.HeaderTableSize = remoteSettings.HeaderTableSize;
                 encoderState.Encoder = new Encoder(remoteSettings.HeaderTableSize);
             }
-            
+            else if (remoteSettings.HeaderTableSize > encoderState.HeaderTableSize)
+            {
+                encoderState.HeaderTableSize = remoteSettings.HeaderTableSize;
+            }
+
             var encoder = encoderState.Encoder;
             using var ms = new MemoryStream();
             var writer  = new BinaryWriter(ms);
@@ -257,11 +262,9 @@ namespace Titanium.Web.Proxy.Http2.Primitives
                 // reusing indexed pseudo-headers across request header blocks, while a
                 // literal-without-indexing representation still preserves connection reuse
                 // for normal headers such as content-type and te.
-                encoder.EncodeHeader(writer, StaticTable.KnownHeaderAuthority, uri.Authority.GetByteString(), false,
-                    HpackUtil.IndexType.None, false);
+                encoder.EncodeHeader(writer, StaticTable.KnownHeaderAuthority, uri.Authority.GetByteString(), false, HpackUtil.IndexType.None, false);
                 encoder.EncodeHeader(writer, StaticTable.KnownHeaderScheme, uri.Scheme.GetByteString());
-                encoder.EncodeHeader(writer, StaticTable.KnownHeaderPath, request.RequestUriString8, false,
-                    HpackUtil.IndexType.None, false);
+                encoder.EncodeHeader(writer, StaticTable.KnownHeaderPath, request.RequestUriString8, false, HpackUtil.IndexType.None, false);
 
                 // RFC 8441 §4: extended-CONNECT WebSocket streams carry :protocol.
                 // Must be encoded after the four mandatory pseudo-headers and before

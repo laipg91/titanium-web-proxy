@@ -121,7 +121,7 @@ namespace Titanium.Web.Proxy.Http2.Hpack
                     int nameIndex = useStaticName ? GetNameIndex(name) : -1;
                     EnsureCapacity(headerSize);
 
-                    EncodeLiteral(output, name, value, indexType, nameIndex);
+                    EncodeLiteral(output, name, value, indexType, nameIndex);                                        
                     if (indexType == HpackUtil.IndexType.Incremental)
                     {
                         Add(name, value);
