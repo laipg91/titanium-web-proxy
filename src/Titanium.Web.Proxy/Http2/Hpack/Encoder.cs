@@ -122,7 +122,10 @@ namespace Titanium.Web.Proxy.Http2.Hpack
                     EnsureCapacity(headerSize);
 
                     EncodeLiteral(output, name, value, indexType, nameIndex);
-                    Add(name, value);
+                    if (indexType == HpackUtil.IndexType.Incremental)
+                    {
+                        Add(name, value);
+                    }
                 }
             }
         }

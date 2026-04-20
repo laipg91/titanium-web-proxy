@@ -228,10 +228,12 @@ namespace Titanium.Web.Proxy.Http2.Primitives
             Action<byte[], int, int>? onWritten,
             CancellationToken cancellationToken)
         {
-            // Favor correctness over compression ratio: a fresh encoder per header block
-            // avoids carrying dynamic-table state across unrelated streams.
-            encoderState.HeaderTableSize = remoteSettings.HeaderTableSize;
-            encoderState.Encoder = new Encoder(remoteSettings.HeaderTableSize);
+            if (encoderState.Encoder == null || remoteSettings.HeaderTableSize != encoderState.HeaderTableSize)
+            {
+                encoderState.HeaderTableSize = remoteSettings.HeaderTableSize;
+                encoderState.Encoder = new Encoder(remoteSettings.HeaderTableSize);
+            }
+            
             var encoder = encoderState.Encoder;
             using var ms = new MemoryStream();
             var writer  = new BinaryWriter(ms);
@@ -246,14 +248,19 @@ namespace Titanium.Web.Proxy.Http2.Primitives
                 writer.Write((byte)((p >>  8) & 0xff));
                 writer.Write((byte)( p        & 0xff));
             }
-
+            
             if (rr is Request request)
             {
                 var uri = request.RequestUri;
-                encoder.EncodeHeader(writer, StaticTable.KnownHeaderMethod,    request.Method.GetByteString());
-                encoder.EncodeHeader(writer, StaticTable.KnownHeaderAuthority, uri.Authority.GetByteString());
-                encoder.EncodeHeader(writer, StaticTable.KnownHeaderScheme,    uri.Scheme.GetByteString());
-                encoder.EncodeHeader(writer, StaticTable.KnownHeaderPath,      request.RequestUriString8, false,
+                encoder.EncodeHeader(writer, StaticTable.KnownHeaderMethod, request.Method.GetByteString());
+                // Keep :authority out of the dynamic table. Some peers are stricter about
+                // reusing indexed pseudo-headers across request header blocks, while a
+                // literal-without-indexing representation still preserves connection reuse
+                // for normal headers such as content-type and te.
+                encoder.EncodeHeader(writer, StaticTable.KnownHeaderAuthority, uri.Authority.GetByteString(), false,
+                    HpackUtil.IndexType.None, false);
+                encoder.EncodeHeader(writer, StaticTable.KnownHeaderScheme, uri.Scheme.GetByteString());
+                encoder.EncodeHeader(writer, StaticTable.KnownHeaderPath, request.RequestUriString8, false,
                     HpackUtil.IndexType.None, false);
 
                 // RFC 8441 §4: extended-CONNECT WebSocket streams carry :protocol.
@@ -291,14 +298,14 @@ namespace Titanium.Web.Proxy.Http2.Primitives
             foreach (var header in headersToEncode)
                 encoder.EncodeHeader(writer, header.NameData, header.ValueData);
 
-            var encoded  = ms.ToArray();
-            var flags    = Http2FrameFlag.EndHeaders;
-            if (endStream)         flags |= Http2FrameFlag.EndStream;
+            var encoded = ms.ToArray();
+            var flags = Http2FrameFlag.EndHeaders;
+            if (endStream) flags |= Http2FrameFlag.EndStream;
             if (rr.Priority.HasValue) flags |= Http2FrameFlag.Priority;
 
             frameHeader.Length = encoded.Length;
-            frameHeader.Type   = Http2FrameType.Headers;
-            frameHeader.Flags  = flags;
+            frameHeader.Type = Http2FrameType.Headers;
+            frameHeader.Flags = flags;
 
             // Debug: trace headers being sent (especially trailers)
             if (endStream && rr is Response)
@@ -314,8 +321,8 @@ namespace Titanium.Web.Proxy.Http2.Primitives
             }
 
             frameHeader.CopyToBuffer(headerBuffer);
-            await destination.WriteAsync(headerBuffer, 0, 9,              cancellationToken);
-            await destination.WriteAsync(encoded,      0, encoded.Length, cancellationToken);
+            await destination.WriteAsync(headerBuffer, 0, 9, cancellationToken);
+            await destination.WriteAsync(encoded, 0, encoded.Length, cancellationToken);
 
             if (onWritten != null)
             {
@@ -323,7 +330,8 @@ namespace Titanium.Web.Proxy.Http2.Primitives
                 Buffer.BlockCopy(headerBuffer, 0, frameBytes, 0, 9);
                 Buffer.BlockCopy(encoded, 0, frameBytes, 9, encoded.Length);
                 onWritten(frameBytes, 0, frameBytes.Length);
-            }
+            }            
+            
         }
 
         // ── DATA ──────────────────────────────────────────────────────────────
