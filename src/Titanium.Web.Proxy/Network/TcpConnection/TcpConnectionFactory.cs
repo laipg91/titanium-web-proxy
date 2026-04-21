@@ -478,20 +478,9 @@ namespace Titanium.Web.Proxy.Network.Tcp
                                 // ignore
                             }
 
-                            try
-                            {
-#if NET451
-                                tcpServerSocket?.Close();
-#else
-                                tcpServerSocket?.Dispose();
-#endif
-                                tcpServerSocket = null;
-                            }
-                            catch
-                            {
-                                // ignore
-                            }
-
+                            SafeCloseSocket(tcpServerSocket);
+                            tcpServerSocket = null;
+                            
                             continue;
                         }
 
@@ -501,11 +490,7 @@ namespace Titanium.Web.Proxy.Network.Tcp
                     {
                         // dispose the current TcpClient and try the next address
                         lastException = e;
-#if NET451
-                        tcpServerSocket?.Close();
-#else
-                        tcpServerSocket?.Dispose();
-#endif
+                        SafeCloseSocket(tcpServerSocket);
                         tcpServerSocket = null;
                     }
 
@@ -605,7 +590,7 @@ namespace Titanium.Web.Proxy.Network.Tcp
                                          enabledSslProtocols >= SslProtocols.Tls11)
             {
                 stream?.Dispose();
-                tcpServerSocket?.Close();
+                SafeCloseSocket(tcpServerSocket);
 
                 // Specifying Tls11 and/or Tls12 will disable the usage of Ssl3, even if it has been included.
                 // https://docs.microsoft.com/en-us/dotnet/api/system.servicemodel.tcptransportsecurity.sslprotocols?view=dotnet-plat-ext-3.1
@@ -620,7 +605,7 @@ namespace Titanium.Web.Proxy.Network.Tcp
                                                      enabledSslProtocols >= SslProtocols.Tls11)
             {
                 stream?.Dispose();
-                tcpServerSocket?.Close();
+                SafeCloseSocket(tcpServerSocket);
 
                 // Specifying Tls11 and/or Tls12 will disable the usage of Ssl3, even if it has been included.
                 // https://docs.microsoft.com/en-us/dotnet/api/system.servicemodel.tcptransportsecurity.sslprotocols?view=dotnet-plat-ext-3.1
@@ -634,7 +619,7 @@ namespace Titanium.Web.Proxy.Network.Tcp
             catch (Exception)
             {
                 stream?.Dispose();
-                tcpServerSocket?.Close();
+                SafeCloseSocket(tcpServerSocket);
                 throw;
             }
 
@@ -848,6 +833,23 @@ namespace Titanium.Web.Proxy.Network.Tcp
             {
                 return Task.Factory.FromAsync(BeginConnect, EndConnect, hostName, port, socket);
             }
+        }
+
+        static void SafeCloseSocket(Socket? socket)
+        {
+            if (socket == null) return;
+
+            try
+            {
+                socket.Shutdown(SocketShutdown.Both);
+            }
+            catch { }
+
+#if NET451
+            try { socket.Close(); } catch { }
+#else
+            try { socket.Dispose(); } catch { }
+#endif
         }
     }
 }

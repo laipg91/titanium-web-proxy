@@ -100,15 +100,15 @@ namespace Titanium.Web.Proxy
                             if (!args.IsTransparent && !args.IsSocks)
                             {
                                 // proxy authorization check
-                            if (connectRequest == null && await CheckAuthorization(args) == false)
-                            {
-                                await OnBeforeResponse(args);
+                                if (connectRequest == null && await CheckAuthorization(args) == false)
+                                {
+                                    await OnBeforeResponse(args);
 
-                                // send the response
-                                await MirrorHttpStreamWritesAsync(clientStream, args.OnDataReceived,
-                                    async () => await clientStream.WriteResponseAsync(args.HttpClient.Response, cancellationToken));
-                                return;
-                            }
+                                    // send the response
+                                    await MirrorHttpStreamWritesAsync(clientStream, args.OnDataReceived,
+                                        async () => await clientStream.WriteResponseAsync(args.HttpClient.Response, cancellationToken));
+                                    return;
+                                }
 
                                 PrepareRequestHeaders(request.Headers);
                                 request.Host = request.RequestUri.Authority;

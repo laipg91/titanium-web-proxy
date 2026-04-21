@@ -449,6 +449,7 @@ public class Http2Tests
         };
 
         var response = await client.SendAsync(request);
+        Assert.AreEqual(HttpVersion.Version20, response.Version);
 
         Assert.AreEqual(HttpStatusCode.OK, response.StatusCode);
         
@@ -467,7 +468,7 @@ public class Http2Tests
         int dataReceivedCount = 0;
         proxy.BeforeRequest += (sender, e) =>
         {
-            if (e.HttpClient.Request.RequestUri.Host.Contains("neverssl.com"))
+            if (e.HttpClient.Request.RequestUri.Host.Contains("httpforever.com"))
             {
                 e.DataSent += (s, args) => dataSentCount++;
                 e.DataReceived += (s, args) => dataReceivedCount++;
@@ -485,7 +486,7 @@ public class Http2Tests
 
         using var client = new HttpClient(handler);
         client.DefaultRequestHeaders.Add("User-Agent", "Mozilla/5.0");
-        var request = new HttpRequestMessage(HttpMethod.Get, "http://neverssl.com/")
+        var request = new HttpRequestMessage(HttpMethod.Get, "http://httpforever.com/")
         {
             Version = HttpVersion.Version20,
             // neverssl.com is HTTP-1.1 accessible, so the proxy will contact it via HTTP/1.1
@@ -502,8 +503,9 @@ public class Http2Tests
         }
 
         Assert.AreEqual(HttpStatusCode.OK, response.StatusCode);
+        Assert.AreEqual(HttpVersion.Version11, response.Version);
         var responseBody = await response.Content.ReadAsStringAsync();
-        Assert.IsTrue(responseBody.Contains("neverssl", StringComparison.OrdinalIgnoreCase), "Response should contain neverssl content");
+        Assert.IsTrue(responseBody.Contains("httpforever", StringComparison.OrdinalIgnoreCase), "Response should contain neverssl content");
         Assert.IsTrue(dataSentCount > 0, "OnDataSent should have fired");
         Assert.IsTrue(dataReceivedCount > 0, "OnDataReceived should have fired");
     }

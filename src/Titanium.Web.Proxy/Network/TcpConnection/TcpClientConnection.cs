@@ -5,6 +5,7 @@ using System.Net.Security;
 using System.Net.Sockets;
 using System.Security.Authentication;
 using System.Threading.Tasks;
+using Org.BouncyCastle.Bcpg;
 using Titanium.Web.Proxy.Helpers;
 using Titanium.Web.Proxy.Models;
 
@@ -91,11 +92,23 @@ namespace Titanium.Web.Proxy.Network.Tcp
                 if (disposing)
                     try
                     {
-                        tcpClientSocket.Close();
+                        tcpClientSocket.Shutdown(SocketShutdown.Both);                        
                     }
                     catch
                     {
                         // ignore
+                    }
+                    finally
+                    {
+                        try
+                        {
+                            tcpClientSocket.Close();
+                        }
+                        catch (Exception)
+                        {
+                            // ignore
+                        }
+
                     }
             });
 
