@@ -117,27 +117,30 @@ namespace Titanium.Web.Proxy.ProxySocket.Authentication
             {
                 GetAuthenticationBytes(buffer);
                 if (Server.Send(buffer, 0, length, SocketFlags.None) < length) throw new SocketException(10054);
+
+                var received = 0;
+                while (received != 2)
+                {
+                    var recv = Server.Receive(buffer, received, 2 - received, SocketFlags.None);
+                    if (recv == 0)
+                        throw new SocketException(10054);
+
+                    received += recv;
+                }
+
+                if (buffer[1] != 0)
+                {
+                    Server.Close();
+                    throw new ProxyException("Username/password combination rejected.");
+                }
             }
             finally
             {
+                //Fixed: should return buffer when job done
                 ArrayPool<byte>.Shared.Return(buffer);
             }
 
-            var received = 0;
-            while (received != 2)
-            {
-                var recv = Server.Receive(buffer, received, 2 - received, SocketFlags.None);
-                if (recv == 0)
-                    throw new SocketException(10054);
-
-                received += recv;
-            }
-
-            if (buffer[1] != 0)
-            {
-                Server.Close();
-                throw new ProxyException("Username/password combination rejected.");
-            }
+            
         }
 
         /// <summary>

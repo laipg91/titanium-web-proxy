@@ -109,15 +109,26 @@ namespace Titanium.Web.Proxy.Network.Tcp
                 if (disposing)
                 {
                     Stream.Dispose();
-
                     try
                     {
-                        TcpSocket.Close();
+                        TcpSocket.Shutdown(SocketShutdown.Both);
                     }
                     catch
                     {
                         // ignore
                     }
+                    finally
+                    {
+                        try
+                        {
+                            TcpSocket.Close();
+                        }
+                        catch
+                        {
+                            // ignore
+                        }
+                    }
+                    
                 }
             });
 

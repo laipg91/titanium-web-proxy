@@ -303,12 +303,13 @@ namespace Titanium.Web.Proxy.ProxySocket
         /// </summary>
         /// <param name="readFirstByte"></param>
         private void ReadUntilHeadersEnd(bool readFirstByte)
-        {
+        {            
             while (Server.Available > 0 && receivedNewlineChars < 4)
             {
                 if (!readFirstByte)
                 {
-                    readFirstByte = false;
+                    //Fixed: After first byte read & store in Buffer out side of this method, need set = true to bypass if conditon and jump to else condition next time
+                    readFirstByte = true;
                 }
                 else
                 {
