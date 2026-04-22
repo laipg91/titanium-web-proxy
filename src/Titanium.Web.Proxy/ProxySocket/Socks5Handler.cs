@@ -464,7 +464,8 @@ namespace Titanium.Web.Proxy.ProxySocket
         {
             try
             {
-                HandleEndSend(ar, BufferCount - ConnectOffset);
+                //HandleEndSend(ar, BufferCount - ConnectOffset);
+                HandleEndSend(ar, handShakeLength);//Fixed: expected length is handShakeLength
             }
             catch (Exception e)
             {

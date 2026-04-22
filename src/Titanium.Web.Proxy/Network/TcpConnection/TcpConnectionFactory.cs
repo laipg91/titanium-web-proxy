@@ -393,106 +393,121 @@ namespace Titanium.Web.Proxy.Network.Tcp
 
                 Array.Sort(ipAddresses, (x, y) => x.AddressFamily.CompareTo(y.AddressFamily));
 
+                IPAddress[]? socksRemoteAddresses = null;
+                var socksTryEachResolvedRemote =
+                    socks && externalProxy != null && !externalProxy.ProxyDnsRequests;
+                if (socksTryEachResolvedRemote)
+                {
+                    socksRemoteAddresses = await Dns.GetHostAddressesAsync(remoteHostName);
+                    
+                    if (socksRemoteAddresses == null || socksRemoteAddresses.Length == 0)
+                        throw new Exception(
+                            $"Could not resolve the SOCKS remote hostname {remoteHostName}");
+
+                    Array.Sort(socksRemoteAddresses,
+                        (x, y) => x.AddressFamily.CompareTo(y.AddressFamily));
+                }
+
                 Exception? lastException = null;
                 for (var i = 0; i < ipAddresses.Length; i++)
-                    try
-                    {
-                        var ipAddress = ipAddresses[i];
-                        var addressFamily = upStreamEndPoint?.AddressFamily ?? ipAddress.AddressFamily;
-
-                        if (socks)
+                {
+                    var remoteAttempts = socksTryEachResolvedRemote ? socksRemoteAddresses!.Length : 1;
+                    for (var r = 0; r < remoteAttempts; r++)
+                        try
                         {
-                            var proxySocket =
-                                new ProxySocket.ProxySocket(addressFamily, SocketType.Stream, ProtocolType.Tcp);
-                            proxySocket.ProxyType = externalProxy!.ProxyType == ExternalProxyType.Socks4
-                                ? ProxyTypes.Socks4
-                                : ProxyTypes.Socks5;
+                            var ipAddress = ipAddresses[i];
+                            var addressFamily = upStreamEndPoint?.AddressFamily ?? ipAddress.AddressFamily;
 
-                            proxySocket.ProxyEndPoint = new IPEndPoint(ipAddress, port);
-                            if (!string.IsNullOrEmpty(externalProxy.UserName) && externalProxy.Password != null)
+                            if (socks)
                             {
-                                proxySocket.ProxyUser = externalProxy.UserName;
-                                proxySocket.ProxyPass = externalProxy.Password;
-                            }
+                                var proxySocket =
+                                    new ProxySocket.ProxySocket(addressFamily, SocketType.Stream, ProtocolType.Tcp);
+                                proxySocket.ProxyType = externalProxy!.ProxyType == ExternalProxyType.Socks4
+                                    ? ProxyTypes.Socks4
+                                    : ProxyTypes.Socks5;
 
-                            tcpServerSocket = proxySocket;
-                        }
-                        else
-                        {
-                            tcpServerSocket = new Socket(addressFamily, SocketType.Stream, ProtocolType.Tcp);
-                        }
+                                proxySocket.ProxyEndPoint = new IPEndPoint(ipAddress, port);
+                                if (!string.IsNullOrEmpty(externalProxy.UserName) && externalProxy.Password != null)
+                                {
+                                    proxySocket.ProxyUser = externalProxy.UserName;
+                                    proxySocket.ProxyPass = externalProxy.Password;
+                                }
 
-                        if (upStreamEndPoint != null) tcpServerSocket.Bind(upStreamEndPoint);
-
-                        tcpServerSocket.NoDelay = proxyServer.NoDelay;
-                        tcpServerSocket.ReceiveTimeout = proxyServer.ConnectionTimeOutSeconds * 1000;
-                        tcpServerSocket.SendTimeout = proxyServer.ConnectionTimeOutSeconds * 1000;
-                        tcpServerSocket.LingerState = new LingerOption(true, proxyServer.TcpTimeWaitSeconds);
-
-                        if (proxyServer.ReuseSocket && RunTime.IsSocketReuseAvailable())
-                            tcpServerSocket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress,
-                                true);
-
-                        Task connectTask;
-
-                        if (socks)
-                        {
-                            if (externalProxy!.ProxyDnsRequests)
-                            {
-                                connectTask =
-                                    ProxySocketConnectionTaskFactory.CreateTask(
-                                        (ProxySocket.ProxySocket)tcpServerSocket,
-                                        remoteHostName, remotePort);
+                                tcpServerSocket = proxySocket;
                             }
                             else
                             {
-                                // todo: resolve only once when the SOCKS proxy has multiple addresses (and the first address fails)
-                                var remoteIpAddresses = await Dns.GetHostAddressesAsync(remoteHostName);
-                                if (remoteIpAddresses == null || remoteIpAddresses.Length == 0)
-                                    throw new Exception(
-                                        $"Could not resolve the SOCKS remote hostname {remoteHostName}");
-
-                                // todo: use the 2nd, 3rd... remote addresses when first fails
-                                connectTask = ProxySocketConnectionTaskFactory.CreateTask(
-                                    (ProxySocket.ProxySocket)tcpServerSocket, remoteIpAddresses[0], remotePort);
+                                tcpServerSocket = new Socket(addressFamily, SocketType.Stream, ProtocolType.Tcp);
                             }
-                        }
-                        else
-                        {
-                            connectTask = SocketConnectionTaskFactory.CreateTask(tcpServerSocket, ipAddress, port);
-                        }
 
-                        await Task.WhenAny(connectTask,
-                            Task.Delay(proxyServer.ConnectTimeOutSeconds * 1000, cancellationToken));
-                        if (!connectTask.IsCompleted || !tcpServerSocket.Connected)
-                        {
-                            // here we can just do some cleanup and let the loop continue since
-                            // we will either get a connection or wind up with a null tcpClient
-                            // which will throw
-                            try
+                            if (upStreamEndPoint != null) tcpServerSocket.Bind(upStreamEndPoint);
+
+                            tcpServerSocket.NoDelay = proxyServer.NoDelay;
+                            tcpServerSocket.ReceiveTimeout = proxyServer.ConnectionTimeOutSeconds * 1000;
+                            tcpServerSocket.SendTimeout = proxyServer.ConnectionTimeOutSeconds * 1000;
+                            tcpServerSocket.LingerState = new LingerOption(true, proxyServer.TcpTimeWaitSeconds);
+
+                            if (proxyServer.ReuseSocket && RunTime.IsSocketReuseAvailable())
+                                tcpServerSocket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress,
+                                    true);
+
+                            Task connectTask;
+
+                            if (socks)
                             {
-                                connectTask.Dispose();
+                                if (externalProxy!.ProxyDnsRequests)
+                                {
+                                    connectTask =
+                                        ProxySocketConnectionTaskFactory.CreateTask(
+                                            (ProxySocket.ProxySocket)tcpServerSocket,
+                                            remoteHostName, remotePort);
+                                }
+                                else
+                                {
+                                    connectTask = ProxySocketConnectionTaskFactory.CreateTask(
+                                        (ProxySocket.ProxySocket)tcpServerSocket,
+                                        socksRemoteAddresses![r], remotePort);
+                                }
                             }
-                            catch
+                            else
                             {
-                                // ignore
+                                connectTask = SocketConnectionTaskFactory.CreateTask(tcpServerSocket, ipAddress, port);
                             }
 
+                            await Task.WhenAny(connectTask,
+                                Task.Delay(proxyServer.ConnectTimeOutSeconds * 1000, cancellationToken));
+                            if (!connectTask.IsCompleted || !tcpServerSocket.Connected)
+                            {
+                                // here we can just do some cleanup and let the loop continue since
+                                // we will either get a connection or wind up with a null tcpClient
+                                // which will throw
+                                try
+                                {
+                                    connectTask.Dispose();
+                                }
+                                catch
+                                {
+                                    // ignore
+                                }
+
+                                SafeCloseSocket(tcpServerSocket);
+                                tcpServerSocket = null;
+
+                                continue;
+                            }
+
+                            break;
+                        }
+                        catch (Exception e)
+                        {
+                            // dispose the current TcpClient and try the next address
+                            lastException = e;
                             SafeCloseSocket(tcpServerSocket);
                             tcpServerSocket = null;
-                            
-                            continue;
                         }
 
-                        break;
-                    }
-                    catch (Exception e)
-                    {
-                        // dispose the current TcpClient and try the next address
-                        lastException = e;
-                        SafeCloseSocket(tcpServerSocket);
-                        tcpServerSocket = null;
-                    }
+                    if (tcpServerSocket != null && tcpServerSocket.Connected) break;
+                }
 
                 if (tcpServerSocket == null)
                 {
